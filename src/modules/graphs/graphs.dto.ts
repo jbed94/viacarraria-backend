@@ -1,5 +1,6 @@
 import {
   IsArray,
+  IsBoolean,
   IsOptional,
   IsString,
   MaxLength,
@@ -16,6 +17,10 @@ export class CreateGraphDto {
   @IsString()
   @MaxLength(1000)
   description?: string;
+
+  @IsOptional()
+  @IsBoolean()
+  isPublic?: boolean;
 }
 
 export class UpdateGraphDto {
@@ -31,4 +36,30 @@ export class CopyGraphDto {
   @MinLength(2)
   @MaxLength(100)
   title!: string;
+
+  @IsOptional()
+  @IsBoolean()
+  isPublic?: boolean;
+}
+
+export class UpdateVisibilityDto {
+  @IsBoolean()
+  isPublic!: boolean;
+}
+
+export class UpdateGraphSettingsDto {
+  @IsOptional()
+  @IsString()
+  @MinLength(2)
+  @MaxLength(100)
+  title?: string;
+
+  @IsOptional()
+  @IsString()
+  @MaxLength(1000)
+  description?: string;
+
+  @IsOptional()
+  @IsBoolean()
+  isPublic?: boolean;
 }

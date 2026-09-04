@@ -20,7 +20,20 @@ export class DatabaseService implements OnModuleInit, OnModuleDestroy {
 
   async onModuleInit(): Promise<void> {
     await this.pool.query('SELECT 1');
-    this.logger.log('Connected to PostgreSQL');
+    await this.pool.query(`
+      CREATE TABLE IF NOT EXISTS "GraphAttachment" (
+        "id" TEXT NOT NULL PRIMARY KEY,
+        "userId" TEXT NOT NULL REFERENCES "User"("id") ON DELETE CASCADE,
+        "graphId" TEXT NOT NULL REFERENCES "Graph"("id") ON DELETE CASCADE,
+        "createdAt" TIMESTAMP(3) NOT NULL DEFAULT CURRENT_TIMESTAMP
+      );
+      CREATE UNIQUE INDEX IF NOT EXISTS "GraphAttachment_userId_graphId_key" ON "GraphAttachment"("userId", "graphId");
+      CREATE INDEX IF NOT EXISTS "GraphAttachment_userId_idx" ON "GraphAttachment"("userId");
+      CREATE INDEX IF NOT EXISTS "GraphAttachment_graphId_idx" ON "GraphAttachment"("graphId");
+    `);
+    this.logger.log(
+      'Connected to PostgreSQL and verified GraphAttachment table',
+    );
   }
 
   async onModuleDestroy(): Promise<void> {

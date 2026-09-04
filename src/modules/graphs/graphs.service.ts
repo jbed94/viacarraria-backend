@@ -22,6 +22,7 @@ import type {
   CopyGraphDto,
   CreateGraphDto,
   UpdateGraphDto,
+  UpdateGraphSettingsDto,
 } from './graphs.dto.js';
 
 export type GraphRecord = {
@@ -48,6 +49,28 @@ export type GraphAccessMetadata = {
   permission: GraphPermission;
   canEdit: boolean;
   accessCount: number;
+  isAttached: boolean;
+  viewerCount: number;
+  ownerName: string;
+  canQuery: boolean;
+};
+
+export type PublicGraphSummary = {
+  id: string;
+  title: string;
+  description: string | null;
+  userId: string;
+  ownerName: string;
+  isPublic: boolean;
+  isPrepared: boolean;
+  isOwned: boolean;
+  isAttached: boolean;
+  canQuery: boolean;
+  viewerCount: number;
+  nodeCount: number;
+  sourceCount: number;
+  createdAt: Date;
+  updatedAt: Date;
 };
 
 type CopySourceRecord = SourceSummary & {
@@ -71,12 +94,15 @@ export class GraphsService {
   private readonly uploadDirectory: string;
 
   async list(identity: ViewerIdentity | undefined): Promise<GraphResponse[]> {
+    const userId = identity?.userId ?? '';
     const graphs = await this.database.query<GraphRecord>(
-      `SELECT "id", "title", "description", "userId", "isPublic", "isPrepared", "nodes", "edges", "createdAt", "updatedAt"
-       FROM "Graph"
-       WHERE "isPublic" = true OR "userId" = $1
-       ORDER BY "isPublic" DESC, "updatedAt" DESC`,
-      [identity?.userId ?? ''],
+      `SELECT g."id", g."title", g."description", g."userId", g."isPublic", g."isPrepared", g."nodes", g."edges", g."createdAt", g."updatedAt"
+       FROM "Graph" g
+       WHERE g."userId" = $1
+          OR (g."isPublic" = true AND EXISTS (SELECT 1 FROM "GraphAttachment" a WHERE a."graphId" = g."id" AND a."userId" = $1))
+          OR (g."isPrepared" = true)
+       ORDER BY (g."userId" = $1) DESC, g."updatedAt" DESC`,
+      [userId],
     );
     return Promise.all(
       graphs.map(async (graph) => ({
@@ -84,6 +110,43 @@ export class GraphsService {
         ...(await this.accessMetadata(identity, graph)),
       })),
     );
+  }
+
+  async listPublic(
+    identity: ViewerIdentity | undefined,
+    search?: string,
+  ): Promise<PublicGraphSummary[]> {
+    const userId = identity?.userId ?? '';
+    const searchFilter = search?.trim() ? `%${search.trim()}%` : null;
+    const query = `
+      SELECT 
+        g."id", 
+        g."title", 
+        g."description", 
+        g."userId", 
+        g."isPublic", 
+        g."isPrepared", 
+        g."createdAt", 
+        g."updatedAt",
+        COALESCE(jsonb_array_length(g."nodes"), 0)::int AS "nodeCount",
+        (SELECT COUNT(*)::int FROM "NodeSource" s WHERE s."graphId" = g."id") AS "sourceCount",
+        (SELECT COUNT(*)::int FROM "GraphAttachment" a WHERE a."graphId" = g."id") AS "viewerCount",
+        (g."userId" = $1) AS "isOwned",
+        EXISTS (SELECT 1 FROM "GraphAttachment" a WHERE a."graphId" = g."id" AND a."userId" = $1) AS "isAttached",
+        COALESCE((SELECT u."name" FROM "User" u WHERE u."id" = g."userId"), 'Community User') AS "ownerName"
+      FROM "Graph" g
+      WHERE g."isPublic" = true
+        AND ($2::text IS NULL OR g."title" ILIKE $2 OR COALESCE(g."description", '') ILIKE $2)
+      ORDER BY "viewerCount" DESC, g."updatedAt" DESC
+    `;
+    const rows = await this.database.query<
+      PublicGraphSummary & { isOwned: boolean; isAttached: boolean }
+    >(query, [userId, searchFilter]);
+
+    return rows.map((row) => ({
+      ...row,
+      canQuery: row.isOwned || row.isAttached || row.isPrepared,
+    }));
   }
 
   async get(
@@ -110,13 +173,20 @@ export class GraphsService {
     const viewer = this.auth.requireRegistered(
       this.auth.requireIdentity(identity),
     );
-    await this.assertGraphQuota(viewer);
+    const isPublic = dto.isPublic === true;
+    await this.assertGraphQuota(viewer, isPublic);
     const id = randomUUID();
     const [graph] = await this.database.query<GraphRecord>(
-      `INSERT INTO "Graph" ("id", "title", "description", "userId", "nodes", "edges", "updatedAt")
-       VALUES ($1, $2, $3, $4, '[]'::jsonb, '[]'::jsonb, CURRENT_TIMESTAMP)
+      `INSERT INTO "Graph" ("id", "title", "description", "userId", "isPublic", "nodes", "edges", "updatedAt")
+       VALUES ($1, $2, $3, $4, $5, '[]'::jsonb, '[]'::jsonb, CURRENT_TIMESTAMP)
        RETURNING "id", "title", "description", "userId", "isPublic", "isPrepared", "nodes", "edges", "createdAt", "updatedAt"`,
-      [id, dto.title.trim(), dto.description?.trim() || null, viewer.userId],
+      [
+        id,
+        dto.title.trim(),
+        dto.description?.trim() || null,
+        viewer.userId,
+        isPublic,
+      ],
     );
     if (!graph) {
       throw new NotFoundException('Graph could not be created.');
@@ -139,7 +209,8 @@ export class GraphsService {
         'Free accounts can copy graphs with up to ten nodes. Upgrade to Pro to copy this graph.',
       );
     }
-    await this.assertGraphQuota(viewer);
+    const isPublic = dto.isPublic === true;
+    await this.assertGraphQuota(viewer, isPublic);
 
     const sources = await this.database.query<CopySourceRecord>(
       `SELECT "id", "nodeId", "graphId", "name", "fileType", "fileUrl", "fileHash", "sizeBytes", "status", "jobId", "content", "error", "createdAt", "updatedAt"
@@ -154,13 +225,14 @@ export class GraphsService {
         sources.every((source) => source.status === 'READY');
       const [copiedGraph] = await this.database.query<GraphRecord>(
         `INSERT INTO "Graph" ("id", "title", "description", "userId", "isPublic", "isPrepared", "nodes", "edges", "updatedAt")
-         VALUES ($1, $2, $3, $4, false, $5, $6::jsonb, $7::jsonb, CURRENT_TIMESTAMP)
+         VALUES ($1, $2, $3, $4, $5, $6, $7::jsonb, $8::jsonb, CURRENT_TIMESTAMP)
          RETURNING "id", "title", "description", "userId", "isPublic", "isPrepared", "nodes", "edges", "createdAt", "updatedAt"`,
         [
           copiedGraphId,
           dto.title.trim(),
           sourceGraph.description,
           viewer.userId,
+          isPublic,
           isPrepared,
           JSON.stringify(sourceGraph.nodes),
           JSON.stringify(sourceGraph.edges),
@@ -255,11 +327,123 @@ export class GraphsService {
     return this.get(viewer, graph.id);
   }
 
+  async updateSettings(
+    identity: ViewerIdentity | undefined,
+    graphId: string,
+    dto: UpdateGraphSettingsDto,
+  ): Promise<GraphDetailResponse> {
+    const viewer = this.auth.requireRegistered(
+      this.auth.requireIdentity(identity),
+    );
+    const graph = await this.findEditable(viewer, graphId);
+
+    let nextIsPublic = graph.isPublic;
+    if (dto.isPublic !== undefined && dto.isPublic !== graph.isPublic) {
+      if (!dto.isPublic) {
+        if (viewer.tier === 'FREE') {
+          const row = await this.database.one<{ privateCount: string }>(
+            'SELECT COUNT(*) FILTER (WHERE "isPublic" = false)::text AS "privateCount" FROM "Graph" WHERE "userId" = $1',
+            [viewer.userId],
+          );
+          if (Number(row?.privateCount ?? '0') >= 2) {
+            throw new ForbiddenException(
+              'Free accounts can have up to two private graphs. Upgrade to Pro for unlimited private graphs.',
+            );
+          }
+        }
+        await this.database.query(
+          'DELETE FROM "GraphAttachment" WHERE "graphId" = $1',
+          [graph.id],
+        );
+      }
+      nextIsPublic = dto.isPublic;
+    }
+
+    const title = dto.title?.trim() || graph.title;
+    const description =
+      dto.description !== undefined
+        ? dto.description.trim() || null
+        : graph.description;
+
+    const [updated] = await this.database.query<GraphRecord>(
+      `UPDATE "Graph" SET "title" = $1, "description" = $2, "isPublic" = $3, "updatedAt" = CURRENT_TIMESTAMP
+       WHERE "id" = $4
+       RETURNING "id", "title", "description", "userId", "isPublic", "isPrepared", "nodes", "edges", "createdAt", "updatedAt"`,
+      [title, description, nextIsPublic, graph.id],
+    );
+    if (!updated) {
+      throw new NotFoundException('Graph not found.');
+    }
+    return this.get(viewer, graph.id);
+  }
+
+  async updateVisibility(
+    identity: ViewerIdentity | undefined,
+    graphId: string,
+    isPublic: boolean,
+  ): Promise<GraphDetailResponse> {
+    return this.updateSettings(identity, graphId, { isPublic });
+  }
+
+  async attach(
+    identity: ViewerIdentity | undefined,
+    graphId: string,
+  ): Promise<GraphDetailResponse> {
+    const viewer = this.auth.requireRegistered(
+      this.auth.requireIdentity(identity),
+    );
+    const graph = await this.database.one<GraphRecord>(
+      `SELECT "id", "title", "description", "userId", "isPublic", "isPrepared", "nodes", "edges", "createdAt", "updatedAt"
+       FROM "Graph" WHERE "id" = $1`,
+      [graphId],
+    );
+    if (!graph) {
+      throw new NotFoundException('Graph not found.');
+    }
+    if (!graph.isPublic) {
+      throw new ForbiddenException('Cannot attach to a private graph.');
+    }
+    if (graph.userId !== viewer.userId) {
+      await this.database.query(
+        `INSERT INTO "GraphAttachment" ("id", "userId", "graphId", "createdAt")
+         VALUES ($1, $2, $3, CURRENT_TIMESTAMP)
+         ON CONFLICT ("userId", "graphId") DO NOTHING`,
+        [randomUUID(), viewer.userId, graph.id],
+      );
+    }
+    return this.get(viewer, graph.id);
+  }
+
+  async detach(
+    identity: ViewerIdentity | undefined,
+    graphId: string,
+  ): Promise<void> {
+    const viewer = this.auth.requireRegistered(
+      this.auth.requireIdentity(identity),
+    );
+    await this.database.query(
+      'DELETE FROM "GraphAttachment" WHERE "userId" = $1 AND "graphId" = $2',
+      [viewer.userId, graphId],
+    );
+  }
+
+  async isAttached(userId: string, graphId: string): Promise<boolean> {
+    const row = await this.database.one(
+      'SELECT 1 FROM "GraphAttachment" WHERE "userId" = $1 AND "graphId" = $2',
+      [userId, graphId],
+    );
+    return Boolean(row);
+  }
+
   async delete(
     identity: ViewerIdentity | undefined,
     graphId: string,
   ): Promise<void> {
     const graph = await this.findEditable(identity, graphId);
+    await this.database.query(
+      'DELETE FROM "GraphAttachment" WHERE "graphId" = $1',
+      [graph.id],
+    );
     await this.database.query('DELETE FROM "Graph" WHERE "id" = $1', [
       graph.id,
     ]);
@@ -297,15 +481,31 @@ export class GraphsService {
     return graph;
   }
 
-  private async assertGraphQuota(viewer: ViewerIdentity): Promise<void> {
-    if (viewer.tier !== 'FREE') return;
-    const row = await this.database.one<{ count: string }>(
-      'SELECT COUNT(*)::text AS "count" FROM "Graph" WHERE "userId" = $1',
+  private async assertGraphQuota(
+    viewer: ViewerIdentity,
+    isPublic: boolean,
+  ): Promise<void> {
+    const row = await this.database.one<{
+      total: string;
+      privateCount: string;
+    }>(
+      `SELECT 
+         COUNT(*)::text AS "total",
+         COUNT(*) FILTER (WHERE "isPublic" = false)::text AS "privateCount"
+       FROM "Graph" WHERE "userId" = $1`,
       [viewer.userId],
     );
-    if (Number(row?.count ?? '0') >= 3) {
+    const total = Number(row?.total ?? '0');
+    const privateCount = Number(row?.privateCount ?? '0');
+    const maxTotal = viewer.tier === 'FREE' ? 5 : 100;
+    if (total >= maxTotal) {
       throw new ForbiddenException(
-        'Free accounts can create up to three custom graphs.',
+        `Your plan supports up to ${maxTotal} custom graphs.`,
+      );
+    }
+    if (!isPublic && viewer.tier === 'FREE' && privateCount >= 2) {
+      throw new ForbiddenException(
+        'Free accounts can have up to two private graphs. Upgrade to Pro for unlimited private graphs.',
       );
     }
   }
@@ -315,20 +515,28 @@ export class GraphsService {
     graph: GraphRecord,
   ): Promise<GraphAccessMetadata> {
     const isOwned = graph.userId === identity?.userId;
-    const accessCount = graph.isPublic
-      ? Number(
-          (
-            await this.database.one<{ count: string }>(
-              'SELECT COUNT(*)::text AS "count" FROM "User" WHERE "isAnonymous" = false',
-            )
-          )?.count ?? '0',
-        )
-      : 1;
+    const isAttached = identity
+      ? await this.isAttached(identity.userId, graph.id)
+      : false;
+    const viewerCountRow = await this.database.one<{ count: string }>(
+      'SELECT COUNT(*)::text AS "count" FROM "GraphAttachment" WHERE "graphId" = $1',
+      [graph.id],
+    );
+    const viewerCount = Number(viewerCountRow?.count ?? '0');
+    const ownerRow = await this.database.one<{ name: string }>(
+      'SELECT "name" FROM "User" WHERE "id" = $1',
+      [graph.userId],
+    );
+    const canQuery = isOwned || isAttached || graph.isPrepared;
     return {
       isOwned,
       permission: isOwned ? 'OWNER' : 'VIEWER',
       canEdit: isOwned,
-      accessCount: Math.max(accessCount, 1),
+      accessCount: Math.max(viewerCount, 0),
+      isAttached,
+      viewerCount,
+      ownerName: ownerRow?.name ?? 'Community User',
+      canQuery,
     };
   }
 

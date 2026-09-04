@@ -176,8 +176,11 @@ export class AuthService {
   async limits(identity: ViewerIdentity | undefined): Promise<LimitsSummary> {
     const viewer = this.requireIdentity(identity);
     const [graphRow, sourceRow, queryUsage, uploadUsage] = await Promise.all([
-      this.database.one<{ count: string }>(
-        'SELECT COUNT(*)::text AS "count" FROM "Graph" WHERE "userId" = $1',
+      this.database.one<{ total: string; privateCount: string }>(
+        `SELECT 
+           COUNT(*)::text AS "total",
+           COUNT(*) FILTER (WHERE "isPublic" = false)::text AS "privateCount"
+         FROM "Graph" WHERE "userId" = $1`,
         [viewer.userId],
       ),
       this.database.one<{ maxCount: string }>(
@@ -197,7 +200,12 @@ export class AuthService {
        FROM "Graph" WHERE "userId" = $1`,
       [viewer.userId],
     );
-    const graphLimit = viewer.isGuest ? 0 : viewer.tier === 'FREE' ? 3 : null;
+    const graphLimit = viewer.isGuest ? 0 : viewer.tier === 'FREE' ? 5 : 100;
+    const privateGraphLimit = viewer.isGuest
+      ? 0
+      : viewer.tier === 'FREE'
+        ? 2
+        : 100;
     const queryLimit =
       viewer.tier === 'ANONYMOUS' ? 3 : viewer.tier === 'FREE' ? 20 : 1000;
     const uploadLimit = viewer.isGuest ? 0 : 10;
@@ -212,7 +220,11 @@ export class AuthService {
       viewer.tier === 'ANONYMOUS' ? 0 : viewer.tier === 'FREE' ? 3 : 15;
     return {
       tier: viewer.tier,
-      graphs: this.limitStatus(Number(graphRow?.count ?? '0'), graphLimit),
+      graphs: this.limitStatus(Number(graphRow?.total ?? '0'), graphLimit),
+      privateGraphs: this.limitStatus(
+        Number(graphRow?.privateCount ?? '0'),
+        privateGraphLimit,
+      ),
       queries: this.limitStatus(queryUsage, queryLimit),
       uploads: this.limitStatus(uploadUsage, uploadLimit),
       selectedNodes: this.limitStatus(

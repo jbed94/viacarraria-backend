@@ -1,4 +1,4 @@
-import type { SearchChunk } from '../../common/types.js';
+import type { LeadAnswerType, SearchChunk } from '../../common/types.js';
 import type { SearchScope, SearchSensitivity } from './search.dto.js';
 
 export type DatabaseChunk = {
@@ -200,4 +200,25 @@ export function applyTabularBoosting<T extends { chunk: SearchChunk }>(
       return item;
     })
     .sort((a, b) => b.chunk.score - a.chunk.score);
+}
+
+export function determineAnswerType(chunk: SearchChunk): LeadAnswerType {
+  if (isTableChunk(chunk)) {
+    return 'tabular';
+  }
+  if (
+    /```[\s\S]*?```/.test(chunk.content) ||
+    /(^|\n)\s*(\d+\.|\([0-9]+\)|step\s+\d+)/i.test(chunk.content)
+  ) {
+    return 'procedural';
+  }
+  if (
+    /(^|\n)#+\s+/m.test(chunk.content) ||
+    /\b(is defined as|refers to|meaning of|overview|conceptually|definition|in essence)\b/i.test(
+      chunk.content,
+    )
+  ) {
+    return 'definitional';
+  }
+  return 'direct';
 }

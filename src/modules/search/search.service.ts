@@ -11,8 +11,13 @@ import { randomUUID } from 'crypto';
 import { DatabaseService } from '../../common/services/database.service.js';
 import { AuthorizationService } from '../../common/authorization/ability.js';
 import { EmbeddingService } from '../../common/services/embedding.service.js';
+import { RerankService } from '../../common/services/rerank.service.js';
 import { WeaviateService } from '../../common/services/weaviate.service.js';
-import type { SearchChunk, ViewerIdentity } from '../../common/types.js';
+import type {
+  LeadAnswer,
+  SearchChunk,
+  ViewerIdentity,
+} from '../../common/types.js';
 import { AuthService } from '../auth/auth.service.js';
 import { GraphsService } from '../graphs/graphs.service.js';
 import type {
@@ -25,6 +30,7 @@ import {
   adjacentNodes,
   applyTabularBoosting,
   chunkText,
+  determineAnswerType,
   groupChunks,
   isTableChunk,
   isTabularQuery,
@@ -51,6 +57,7 @@ type QueryRecord = {
 
 export type SearchResponse = {
   queryId: string;
+  leadAnswer?: LeadAnswer;
   results: Array<{ nodeId: string; matchCount: number; chunks: SearchChunk[] }>;
   matchedNodeIds: string[];
   remaining: number;
@@ -67,6 +74,7 @@ export class SearchService implements OnApplicationBootstrap {
   constructor(
     private readonly database: DatabaseService,
     private readonly embeddings: EmbeddingService,
+    private readonly rerank: RerankService,
     private readonly weaviate: WeaviateService,
     private readonly graphs: GraphsService,
     private readonly auth: AuthService,
@@ -110,6 +118,14 @@ export class SearchService implements OnApplicationBootstrap {
     const viewer = this.auth.requireIdentity(identity);
     const graph = await this.graphs.findAccessible(viewer, dto.graphId);
     this.authorization.assertCan(viewer, 'query', 'Graph', graph);
+    if (!graph.isPrepared && graph.userId !== viewer.userId) {
+      const isAttached = await this.graphs.isAttached(viewer.userId, graph.id);
+      if (!isAttached) {
+        throw new ForbiddenException(
+          'Please attach to this graph to enable querying.',
+        );
+      }
+    }
     const availableNodeIds = new Set(graph.nodes.map((node) => node.id));
     const selectedNodeIds = [
       ...new Set(
@@ -154,6 +170,32 @@ export class SearchService implements OnApplicationBootstrap {
       sensitivity,
       scope,
     );
+
+    if (retrieved.length > 0) {
+      try {
+        const rerankResults = await this.rerank.rerank(
+          queryText,
+          retrieved.map((r) => r.chunk.content),
+        );
+        if (rerankResults && rerankResults.length > 0) {
+          for (const item of rerankResults) {
+            const target = retrieved[item.index];
+            if (target) {
+              target.chunk.rerankScore = item.score;
+              target.chunk.score = item.score;
+            }
+          }
+          retrieved.sort(
+            (a, b) =>
+              (b.chunk.rerankScore ?? b.chunk.score) -
+              (a.chunk.rerankScore ?? a.chunk.score),
+          );
+        }
+      } catch {
+        // Fall back to initial retrieval ordering if reranker fails
+      }
+    }
+
     const chunks = await this.extendMatches(
       graph.id,
       graph.edges,
@@ -164,6 +206,45 @@ export class SearchService implements OnApplicationBootstrap {
       sensitivity,
     );
     const results = groupChunks(chunks, scope);
+
+    let leadAnswer: LeadAnswer | undefined = undefined;
+    const topChunk = chunks.find((c) => c.kind === 'MATCH') ?? chunks[0];
+    if (topChunk) {
+      const nodeMap = new Map(graph.nodes.map((n) => [n.id, n]));
+      const prerequisiteNodes = graph.edges
+        .filter((edge) => edge.target === topChunk.nodeId)
+        .map((edge) => ({
+          id: edge.source,
+          title: nodeMap.get(edge.source)?.data?.title || edge.source,
+        }))
+        .filter(
+          (node, idx, arr) => arr.findIndex((x) => x.id === node.id) === idx,
+        );
+
+      const extensionNodes = graph.edges
+        .filter((edge) => edge.source === topChunk.nodeId)
+        .map((edge) => ({
+          id: edge.target,
+          title: nodeMap.get(edge.target)?.data?.title || edge.target,
+        }))
+        .filter(
+          (node, idx, arr) => arr.findIndex((x) => x.id === node.id) === idx,
+        );
+
+      const surroundingContext = (topChunk.extendedContext ?? []).filter(
+        (c) => c.sourceId === topChunk.sourceId,
+      );
+
+      leadAnswer = {
+        chunk: topChunk,
+        score: topChunk.rerankScore ?? topChunk.score,
+        answerType: determineAnswerType(topChunk),
+        prerequisiteNodes,
+        extensionNodes,
+        surroundingContext,
+      };
+    }
+
     const [stored] = await this.database.query<{ id: string }>(
       `INSERT INTO "Query" ("id", "userId", "graphId", "queryText", "selectedNodeIds", "results", "updatedAt")
        VALUES ($1, $2, $3, $4, $5::jsonb, $6::jsonb, CURRENT_TIMESTAMP)
@@ -182,6 +263,7 @@ export class SearchService implements OnApplicationBootstrap {
     }
     return {
       queryId: stored.id,
+      leadAnswer,
       results,
       matchedNodeIds: results.map((result) => result.nodeId),
       remaining: quota.remaining,
@@ -226,12 +308,19 @@ export class SearchService implements OnApplicationBootstrap {
     dto: UpdateQueryDto,
   ): Promise<QueryRecord> {
     const viewer = this.auth.requireIdentity(identity);
+    const hasTitle = dto.title !== undefined;
+    const titleVal = hasTitle ? dto.title?.trim() || null : null;
+    const hasPinned = dto.isPinned !== undefined;
+    const pinnedVal = hasPinned ? (dto.isPinned ?? false) : false;
+
     const [query] = await this.database.query<QueryRecord>(
       `UPDATE "Query"
-       SET "title" = COALESCE($1, "title"), "isPinned" = COALESCE($2, "isPinned"), "updatedAt" = CURRENT_TIMESTAMP
-       WHERE "id" = $3 AND "userId" = $4
+       SET "title" = CASE WHEN $1::boolean THEN $2 ELSE "title" END,
+           "isPinned" = CASE WHEN $3::boolean THEN $4 ELSE "isPinned" END,
+           "updatedAt" = CURRENT_TIMESTAMP
+       WHERE "id" = $5 AND "userId" = $6
        RETURNING "id", "graphId", "queryText", "selectedNodeIds", "results", "title", "isPinned", "createdAt", "updatedAt"`,
-      [dto.title?.trim() || null, dto.isPinned ?? null, queryId, viewer.userId],
+      [hasTitle, titleVal, hasPinned, pinnedVal, queryId, viewer.userId],
     );
     if (!query) {
       throw new NotFoundException('Query not found.');
