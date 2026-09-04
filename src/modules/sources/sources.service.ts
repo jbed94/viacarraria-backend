@@ -8,13 +8,15 @@ import {
 } from '@nestjs/common';
 import { ConfigService } from '@nestjs/config';
 import { createHash, randomUUID } from 'crypto';
-import { mkdir, rm, writeFile } from 'fs/promises';
+import { existsSync } from 'fs';
+import { readFile } from 'fs/promises';
 import { basename, extname, join } from 'path';
 
 import { DatabaseService } from '../../common/services/database.service.js';
 import { AuthorizationService } from '../../common/authorization/ability.js';
 import { RabbitMqService } from '../../common/services/rabbitmq.service.js';
 import { RedisService } from '../../common/services/redis.service.js';
+import { StorageService } from '../../common/services/storage.service.js';
 import type { ViewerIdentity } from '../../common/types.js';
 import { AuthService } from '../auth/auth.service.js';
 import { GraphsService, type SourceSummary } from '../graphs/graphs.service.js';
@@ -40,6 +42,7 @@ export class SourcesService {
     private readonly database: DatabaseService,
     private readonly redis: RedisService,
     private readonly rabbitMq: RabbitMqService,
+    private readonly storage: StorageService,
     private readonly graphs: GraphsService,
     private readonly auth: AuthService,
     private readonly authorization: AuthorizationService,
@@ -110,9 +113,14 @@ export class SourcesService {
     const extension =
       extname(file.originalname).toLowerCase() || this.extensionFor(fileType);
     const fileName = `${sourceId}${extension}`;
-    const filePath = join(this.uploadDirectory, fileName);
-    await mkdir(this.uploadDirectory, { recursive: true });
-    await writeFile(filePath, file.buffer);
+    const storageKey = `sources/${graph.id}/${sourceId}/${fileName}`;
+
+    const stored = await this.storage.putObject(
+      storageKey,
+      file.buffer,
+      fileType,
+    );
+    const fileUrl = stored.location;
 
     const content = fileType.startsWith('text/')
       ? file.buffer.toString('utf8')
@@ -130,7 +138,7 @@ export class SourcesService {
           graph.id,
           basename(file.originalname),
           fileType,
-          filePath,
+          fileUrl,
           fileHash,
           file.size,
           jobId,
@@ -150,7 +158,7 @@ export class SourcesService {
         sourceId,
         graphId: graph.id,
         nodeId: dto.nodeId,
-        filePath,
+        filePath: fileUrl,
         fileName: source?.name ?? file.originalname,
         fileHash,
         priority: viewer.tier === 'PRO' ? 10 : 1,
@@ -159,7 +167,7 @@ export class SourcesService {
       await this.database.query('DELETE FROM "NodeSource" WHERE "id" = $1', [
         sourceId,
       ]);
-      await rm(filePath, { force: true });
+      await this.storage.deleteObject(storageKey);
       throw error;
     }
     if (!source) {
@@ -171,6 +179,7 @@ export class SourcesService {
   async get(
     identity: ViewerIdentity | undefined,
     sourceId: string,
+    token?: string,
   ): Promise<SourceRecord> {
     const source = await this.database.one<SourceRecord>(
       `SELECT "id", "nodeId", "graphId", "name", "fileType", "fileUrl", "sizeBytes", "status", "jobId", "content", "error", "createdAt", "updatedAt"
@@ -180,11 +189,13 @@ export class SourcesService {
     if (!source) {
       throw new NotFoundException('Source not found.');
     }
-    const graph = await this.graphs.findAccessible(identity, source.graphId);
-    this.authorization.assertCan(identity, 'read', 'Source', {
-      graphUserId: graph.userId,
-      graphIsPublic: graph.isPublic,
-    });
+    if (!token || token !== this.internalToken) {
+      const graph = await this.graphs.findAccessible(identity, source.graphId);
+      this.authorization.assertCan(identity, 'read', 'Source', {
+        graphUserId: graph.userId,
+        graphIsPublic: graph.isPublic,
+      });
+    }
     return source;
   }
 
@@ -210,6 +221,133 @@ export class SourcesService {
     };
   }
 
+  async download(
+    identity: ViewerIdentity | undefined,
+    sourceId: string,
+    rangeHeader?: string,
+    token?: string,
+  ): Promise<{
+    buffer: Buffer;
+    contentType: string;
+    contentLength: number;
+    fileName: string;
+    status: number;
+    contentRange?: string;
+    acceptRanges?: string;
+  }> {
+    const source = await this.get(identity, sourceId, token);
+    if (source.fileUrl.startsWith('seed://')) {
+      const isPdf =
+        source.fileType === 'application/pdf' ||
+        source.name.toLowerCase().endsWith('.pdf');
+
+      let buffer: Buffer;
+      let contentType: string;
+      let fileName: string;
+
+      if (isPdf) {
+        contentType = 'application/pdf';
+        fileName = source.name.toLowerCase().endsWith('.pdf')
+          ? source.name
+          : `${source.name}.pdf`;
+
+        const candidatePaths = [
+          join(this.uploadDirectory, `${source.id}.pdf`),
+          join(this.uploadDirectory, fileName),
+          join(
+            process.cwd(),
+            '..',
+            'viacarraria-database',
+            'prisma',
+            'seed-data',
+            'pdfs',
+            `${source.id}.pdf`,
+          ),
+        ];
+
+        const existingPath = candidatePaths.find((p) => existsSync(p));
+        if (existingPath) {
+          buffer = await readFile(existingPath);
+        } else {
+          buffer = this.generateSeedPdf(source.name, source.content || '');
+        }
+      } else {
+        buffer = Buffer.from(source.content || '', 'utf8');
+        contentType = 'text/markdown';
+        fileName = `${source.name.replace(/\.[^.]+$/, '')}.md`;
+      }
+
+      if (rangeHeader && rangeHeader.startsWith('bytes=')) {
+        const rangeParts = rangeHeader.replace(/bytes=/, '').split('-');
+        const start = Number.parseInt(rangeParts[0] ?? '0', 10) || 0;
+        const end = rangeParts[1]
+          ? Number.parseInt(rangeParts[1], 10)
+          : buffer.length - 1;
+        const slice = buffer.subarray(start, end + 1);
+        return {
+          buffer: slice,
+          contentType,
+          contentLength: slice.length,
+          fileName,
+          status: 206,
+          contentRange: `bytes ${start}-${end}/${buffer.length}`,
+          acceptRanges: 'bytes',
+        };
+      }
+
+      return {
+        buffer,
+        contentType,
+        contentLength: buffer.length,
+        fileName,
+        status: 200,
+        acceptRanges: 'bytes',
+      };
+    }
+
+    const result = await this.storage.getObject(source.fileUrl, rangeHeader);
+    return {
+      ...result,
+      fileName: source.name,
+    };
+  }
+
+  async getFileUrl(
+    identity: ViewerIdentity | undefined,
+    sourceId: string,
+  ): Promise<{ url: string; direct: boolean; fileName: string }> {
+    const source = await this.get(identity, sourceId);
+    if (source.fileUrl.startsWith('seed://')) {
+      return {
+        url: `/api/sources/${source.id}/download`,
+        direct: false,
+        fileName: source.name,
+      };
+    }
+
+    if (this.storage.getDriver() === 's3') {
+      try {
+        const presignedUrl = await this.storage.getSignedUrl(
+          source.fileUrl,
+          3600,
+        );
+        return { url: presignedUrl, direct: true, fileName: source.name };
+      } catch {
+        return {
+          url: `/api/sources/${source.id}/download`,
+          direct: false,
+          fileName: source.name,
+        };
+      }
+    }
+
+    return {
+      url: `/api/sources/${source.id}/download`,
+      direct: false,
+      fileName: source.name,
+    };
+  }
+
   async delete(
     identity: ViewerIdentity | undefined,
     sourceId: string,
@@ -220,7 +358,7 @@ export class SourcesService {
       source.id,
     ]);
     if (!source.fileUrl.startsWith('seed://')) {
-      await rm(source.fileUrl, { force: true });
+      await this.storage.deleteObject(source.fileUrl);
     }
   }
 
@@ -299,5 +437,132 @@ export class SourcesService {
       : fileType === 'text/markdown'
         ? '.md'
         : '.txt';
+  }
+
+  private generateSeedPdf(title: string, description: string): Buffer {
+    const cleanTitle = title.replace(/\.pdf$/i, '').trim();
+    const cleanDesc =
+      description
+        .replace(/[#*`_-]/g, ' ')
+        .replace(/\s+/g, ' ')
+        .trim() ||
+      'Official curriculum syllabus, reading guide, and core lecture outline.';
+
+    const page1Text = [
+      'BT',
+      '/F1 16 Tf',
+      '50 730 Td',
+      `(${this.escapePdfText(cleanTitle)} - Syllabus) Tj`,
+      '/F2 10 Tf',
+      '0 -24 Td',
+      '(Via Carraria Academic Curriculum - Spatial GraphRAG) Tj',
+      '0 -20 Td',
+      '(--------------------------------------------------------------------------------) Tj',
+      '/F1 12 Tf',
+      '0 -26 Td',
+      '(1. Course Overview & Description) Tj',
+      '/F2 10 Tf',
+      '0 -18 Td',
+      `(${this.escapePdfText(cleanDesc.slice(0, 85))}) Tj`,
+      '0 -14 Td',
+      `(${this.escapePdfText(cleanDesc.slice(85, 170) || 'Comprehensive coverage of core principles and analytical methods.')}) Tj`,
+      '0 -24 Td',
+      '/F1 12 Tf',
+      '(2. Core Modules & Competencies) Tj',
+      '/F2 10 Tf',
+      '0 -18 Td',
+      '(* Module 1: Theoretical Foundations and Prerequisites) Tj',
+      '0 -18 Td',
+      '(* Module 2: Structural Modeling and Systematic Exploration) Tj',
+      '0 -18 Td',
+      '(* Module 3: Applied Methodologies, Spatial Reasoning, and Practice) Tj',
+      '0 -24 Td',
+      '/F1 12 Tf',
+      '(3. Assessment & Examination Structure) Tj',
+      '/F2 10 Tf',
+      '0 -18 Td',
+      '(Practical Labs: 40% | Midterm Assessment: 25% | Final Capstone: 35%) Tj',
+      'ET',
+    ].join('\n');
+
+    const page2Text = [
+      'BT',
+      '/F1 16 Tf',
+      '50 730 Td',
+      `(${this.escapePdfText(cleanTitle)} - Reading & Reference Guide) Tj`,
+      '/F2 10 Tf',
+      '0 -24 Td',
+      '(Recommended Bibliography & Primary Literature) Tj',
+      '0 -20 Td',
+      '(--------------------------------------------------------------------------------) Tj',
+      '/F1 12 Tf',
+      '0 -26 Td',
+      '(4. Primary Reference Literature) Tj',
+      '/F2 10 Tf',
+      '0 -20 Td',
+      `([1] Standard Reference Handbook for ${this.escapePdfText(cleanTitle)}) Tj`,
+      '0 -14 Td',
+      '(    Fundamental textbook covering theoretical foundations and proof techniques.) Tj',
+      '0 -20 Td',
+      '([2] Contemporary Applied Case Studies and Research Publications) Tj',
+      '0 -14 Td',
+      '(    Empirical analysis, domain benchmarks, and algorithmic implementations.) Tj',
+      '0 -30 Td',
+      '/F1 12 Tf',
+      '(5. Academic Integrity & Study Directives) Tj',
+      '/F2 10 Tf',
+      '0 -18 Td',
+      '(Students must connect prerequisites visually on the knowledge canvas.) Tj',
+      '0 -14 Td',
+      '(Review prompts and core notes should be cross-referenced regularly.) Tj',
+      'ET',
+    ].join('\n');
+
+    const stream1Length = Buffer.byteLength(page1Text, 'latin1');
+    const stream2Length = Buffer.byteLength(page2Text, 'latin1');
+
+    const header = '%PDF-1.4\n%\xE2\xE3\xCF\xD3\n';
+    const obj1 = '1 0 obj\n<< /Type /Catalog /Pages 2 0 R >>\nendobj\n';
+    const obj2 =
+      '2 0 obj\n<< /Type /Pages /Kids [3 0 R 4 0 R] /Count 2 >>\nendobj\n';
+    const obj3 =
+      '3 0 obj\n<< /Type /Page /Parent 2 0 R /MediaBox [0 0 612 792] /Resources << /Font << /F1 5 0 R /F2 6 0 R >> >> /Contents 7 0 R >>\nendobj\n';
+    const obj4 =
+      '4 0 obj\n<< /Type /Page /Parent 2 0 R /MediaBox [0 0 612 792] /Resources << /Font << /F1 5 0 R /F2 6 0 R >> >> /Contents 8 0 R >>\nendobj\n';
+    const obj5 =
+      '5 0 obj\n<< /Type /Font /Subtype /Type1 /BaseFont /Helvetica-Bold >>\nendobj\n';
+    const obj6 =
+      '6 0 obj\n<< /Type /Font /Subtype /Type1 /BaseFont /Helvetica >>\nendobj\n';
+    const obj7 = `7 0 obj\n<< /Length ${stream1Length} >>\nstream\n${page1Text}\nendstream\nendobj\n`;
+    const obj8 = `8 0 obj\n<< /Length ${stream2Length} >>\nstream\n${page2Text}\nendstream\nendobj\n`;
+
+    const objects = [obj1, obj2, obj3, obj4, obj5, obj6, obj7, obj8];
+
+    let currentOffset = Buffer.byteLength(header, 'latin1');
+    const offsets: number[] = [];
+
+    for (const obj of objects) {
+      offsets.push(currentOffset);
+      currentOffset += Buffer.byteLength(obj, 'latin1');
+    }
+
+    const xrefOffset = currentOffset;
+    let xref = `xref\n0 ${objects.length + 1}\n0000000000 65535 f \n`;
+    for (const off of offsets) {
+      xref += `${off.toString().padStart(10, '0')} 00000 n \n`;
+    }
+
+    const trailer = `trailer\n<< /Size ${objects.length + 1} /Root 1 0 R >>\nstartxref\n${xrefOffset}\n%%EOF\n`;
+
+    const fullPdf = header + objects.join('') + xref + trailer;
+    return Buffer.from(fullPdf, 'latin1');
+  }
+
+  private escapePdfText(text: string): string {
+    return text
+      .replace(/\\/g, '\\\\')
+      .replace(/\(/g, '\\(')
+      .replace(/\)/g, '\\)')
+      .replace(/[^\x20-\x7E]/g, ' ');
   }
 }

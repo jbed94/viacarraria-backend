@@ -11,11 +11,7 @@ import {
 } from '@nestjs/common';
 
 import type { AuthenticatedRequest } from '../../common/types.js';
-import {
-  CopyGraphDto,
-  CreateGraphDto,
-  UpdateGraphDto,
-} from './graphs.dto.js';
+import { CopyGraphDto, CreateGraphDto, UpdateGraphDto } from './graphs.dto.js';
 import { GraphsService } from './graphs.service.js';
 
 @Controller('graphs')

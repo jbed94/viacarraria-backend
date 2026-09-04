@@ -31,4 +31,17 @@ export class SearchController {
   ) {
     return this.searchService.update(request.identity, id, dto);
   }
+
+  @Post('graphs/:id/index')
+  async indexGraph(
+    @Req() request: AuthenticatedRequest,
+    @Param('id') id: string,
+  ) {
+    const internalToken = request.headers['x-internal-token'];
+    const expectedToken = process.env.INTERNAL_SERVICE_TOKEN;
+    if (internalToken && expectedToken && internalToken === expectedToken) {
+      return this.searchService.indexGraphSources(id);
+    }
+    return this.searchService.indexGraph(request.identity, id);
+  }
 }

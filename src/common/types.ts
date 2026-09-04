@@ -60,6 +60,8 @@ export type SearchChunk = {
   startChar: number;
   endChar: number;
   pageNum: number;
+  coordinates?: number[];
+  elementType?: string;
   score: number;
   kind?: 'MATCH' | 'EXTENDED';
   extendedContext?: SearchChunk[];

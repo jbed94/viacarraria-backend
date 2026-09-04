@@ -5,6 +5,7 @@ import { DatabaseService } from './services/database.service.js';
 import { EmbeddingService } from './services/embedding.service.js';
 import { RabbitMqService } from './services/rabbitmq.service.js';
 import { RedisService } from './services/redis.service.js';
+import { StorageService } from './services/storage.service.js';
 import { UpstashRateLimitService } from './services/upstash-rate-limit.service.js';
 import { WeaviateService } from './services/weaviate.service.js';
 
@@ -16,6 +17,7 @@ import { WeaviateService } from './services/weaviate.service.js';
     EmbeddingService,
     RedisService,
     RabbitMqService,
+    StorageService,
     WeaviateService,
     UpstashRateLimitService,
   ],
@@ -25,6 +27,7 @@ import { WeaviateService } from './services/weaviate.service.js';
     EmbeddingService,
     RedisService,
     RabbitMqService,
+    StorageService,
     WeaviateService,
     UpstashRateLimitService,
   ],

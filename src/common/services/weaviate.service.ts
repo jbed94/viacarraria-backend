@@ -2,6 +2,7 @@ import { Injectable } from '@nestjs/common';
 import { ConfigService } from '@nestjs/config';
 
 import type { SearchChunk } from '../types.js';
+import { isTabularQuery } from '../../modules/search/search.utils.js';
 
 type VectorizedSearchChunk = SearchChunk & { vector?: number[] };
 
@@ -50,25 +51,101 @@ export class WeaviateService {
     }
   }
 
+  async upsertBatch(
+    chunks: SearchChunk[],
+    vectors?: Array<number[] | undefined>,
+  ): Promise<number> {
+    if (chunks.length === 0) {
+      return 0;
+    }
+    await this.ensureSchema();
+
+    const uniqueGraphIds = [...new Set(chunks.map((chunk) => chunk.graphId))];
+    await Promise.all(
+      uniqueGraphIds.map((graphId) => this.ensureTenant(graphId)),
+    );
+
+    const objects = chunks.map((chunk, index) => {
+      const vector = vectors?.[index];
+      return {
+        class: 'Chunk',
+        id: `${chunk.sourceId}-${chunk.startChar}-${chunk.endChar}`,
+        tenant: chunk.graphId,
+        properties: {
+          graphId: chunk.graphId,
+          sourceId: chunk.sourceId,
+          sourceName: chunk.sourceName,
+          nodeId: chunk.nodeId,
+          content: chunk.content,
+          context: chunk.context,
+          startChar: chunk.startChar,
+          endChar: chunk.endChar,
+          pageNum: chunk.pageNum ?? 1,
+          ...(chunk.coordinates?.length
+            ? { coordinates: chunk.coordinates }
+            : {}),
+          ...(chunk.elementType ? { elementType: chunk.elementType } : {}),
+        },
+        ...(vector?.length ? { vector } : {}),
+      };
+    });
+
+    const batchSize = 100;
+    let indexedCount = 0;
+
+    for (let i = 0; i < objects.length; i += batchSize) {
+      const slice = objects.slice(i, i + batchSize);
+      const response = await this.request('/v1/batch/objects', {
+        method: 'POST',
+        body: JSON.stringify({ objects: slice }),
+      });
+
+      if (response.ok || response.status === 200) {
+        indexedCount += slice.length;
+      } else if (response.status !== 422) {
+        throw new Error(`Weaviate batch write failed: ${response.status}`);
+      }
+    }
+
+    return indexedCount;
+  }
+
+  async ensureTenant(graphId: string): Promise<void> {
+    try {
+      await this.ensureSchema();
+      await this.request('/v1/schema/Chunk/tenants', {
+        method: 'POST',
+        body: JSON.stringify([{ name: graphId }]),
+      });
+    } catch {
+      // Tenant may already exist
+    }
+  }
+
   async hybridSearch(
     graphId: string,
     query: string,
     selectedNodeIds: string[],
     vector: number[],
+    limit = 25,
+    minScore?: number,
   ): Promise<VectorizedSearchChunk[]> {
     if (selectedNodeIds.length === 0) {
       return [];
     }
     await this.ensureSchema();
+    const candidateLimit = isTabularQuery(query)
+      ? Math.min(limit * 2, 50)
+      : limit;
     const graphQuery = `{
       Get {
         Chunk(
           tenant: ${JSON.stringify(graphId)}
           hybrid: { query: ${JSON.stringify(query)}, vector: ${JSON.stringify(vector)}, alpha: 0.7 }
           where: { path: ["graphId"], operator: Equal, valueText: ${JSON.stringify(graphId)} }
-          limit: 25
+          limit: ${candidateLimit}
         ) {
-          graphId sourceId sourceName nodeId content context startChar endChar pageNum
+          graphId sourceId sourceName nodeId content context startChar endChar pageNum coordinates elementType
           _additional { score vector }
         }
       }
@@ -82,10 +159,21 @@ export class WeaviateService {
     }
     const body = (await response.json()) as {
       data?: { Get?: { Chunk?: Array<Record<string, unknown>> } };
+      errors?: Array<{ message: string }>;
     };
-    return this.toSearchChunks(body.data?.Get?.Chunk ?? [], graphId).filter(
-      (chunk) => selectedNodeIds.includes(chunk.nodeId),
-    );
+    if (
+      body.errors?.some((error) => error.message.includes('tenant not found'))
+    ) {
+      return [];
+    }
+    const chunks = this.toSearchChunks(
+      body.data?.Get?.Chunk ?? [],
+      graphId,
+    ).filter((chunk) => selectedNodeIds.includes(chunk.nodeId));
+    if (minScore !== undefined) {
+      return chunks.filter((chunk) => chunk.score >= minScore);
+    }
+    return chunks;
   }
 
   async vectorSearch(
@@ -93,6 +181,7 @@ export class WeaviateService {
     vector: number[],
     adjacentNodeIds: string[],
     limit: number,
+    minScore?: number,
   ): Promise<SearchChunk[]> {
     if (adjacentNodeIds.length === 0 || limit < 1) {
       return [];
@@ -120,10 +209,20 @@ export class WeaviateService {
     }
     const body = (await response.json()) as {
       data?: { Get?: { Chunk?: Array<Record<string, unknown>> } };
+      errors?: Array<{ message: string }>;
     };
-    return this.toSearchChunks(body.data?.Get?.Chunk ?? [], graphId)
+    if (
+      body.errors?.some((error) => error.message.includes('tenant not found'))
+    ) {
+      return [];
+    }
+    const chunks = this.toSearchChunks(body.data?.Get?.Chunk ?? [], graphId)
       .filter((chunk) => adjacentNodeIds.includes(chunk.nodeId))
       .map(withoutVector);
+    if (minScore !== undefined) {
+      return chunks.filter((chunk) => chunk.score >= minScore);
+    }
+    return chunks;
   }
 
   private toSearchChunks(
@@ -162,6 +261,11 @@ export class WeaviateService {
           endChar:
             typeof item.endChar === 'number' ? item.endChar : content.length,
           pageNum: typeof item.pageNum === 'number' ? item.pageNum : 1,
+          coordinates: Array.isArray(item.coordinates)
+            ? (item.coordinates as number[])
+            : undefined,
+          elementType:
+            typeof item.elementType === 'string' ? item.elementType : undefined,
           score: Number.parseFloat(additional?.score ?? '0'),
           ...(vector?.length ? { vector } : {}),
         },
@@ -175,8 +279,15 @@ export class WeaviateService {
       const body = (await schema.json()) as {
         properties?: Array<{ name?: string }>;
       };
-      if (!body.properties?.some((property) => property.name === 'pageNum')) {
-        await this.addPageNumberProperty();
+      const existing = new Set(body.properties?.map((prop) => prop.name));
+      if (!existing.has('pageNum')) {
+        await this.addProperty('pageNum', ['int']);
+      }
+      if (!existing.has('coordinates')) {
+        await this.addProperty('coordinates', ['number[]']);
+      }
+      if (!existing.has('elementType')) {
+        await this.addProperty('elementType', ['text']);
       }
       return;
     }
@@ -200,6 +311,8 @@ export class WeaviateService {
           { name: 'startChar', dataType: ['int'] },
           { name: 'endChar', dataType: ['int'] },
           { name: 'pageNum', dataType: ['int'] },
+          { name: 'coordinates', dataType: ['number[]'] },
+          { name: 'elementType', dataType: ['text'] },
         ],
       }),
     });
@@ -208,10 +321,10 @@ export class WeaviateService {
     }
   }
 
-  private async addPageNumberProperty(): Promise<void> {
+  private async addProperty(name: string, dataType: string[]): Promise<void> {
     const response = await this.request('/v1/schema/Chunk/properties', {
       method: 'POST',
-      body: JSON.stringify({ name: 'pageNum', dataType: ['int'] }),
+      body: JSON.stringify({ name, dataType }),
     });
     if (!response.ok && response.status !== 422) {
       throw new Error(`Weaviate schema update failed: ${response.status}`);

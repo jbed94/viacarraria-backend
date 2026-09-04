@@ -215,7 +215,10 @@ export class AuthService {
       graphs: this.limitStatus(Number(graphRow?.count ?? '0'), graphLimit),
       queries: this.limitStatus(queryUsage, queryLimit),
       uploads: this.limitStatus(uploadUsage, uploadLimit),
-      selectedNodes: this.limitStatus(0, viewer.isGuest ? 2 : viewer.tier === 'FREE' ? 10 : null),
+      selectedNodes: this.limitStatus(
+        0,
+        viewer.isGuest ? 2 : viewer.tier === 'FREE' ? 10 : null,
+      ),
       nodesPerGraph: this.limitStatus(
         Number(maxNodes?.maxCount ?? '0'),
         nodeLimit,

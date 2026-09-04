@@ -1,6 +1,7 @@
 import {
   IsArray,
   IsBoolean,
+  IsIn,
   IsOptional,
   IsString,
   MaxLength,
@@ -25,7 +26,18 @@ export class SearchDto {
   @IsOptional()
   @IsBoolean()
   extendedSearch?: boolean;
+
+  @IsOptional()
+  @IsIn(['low', 'medium', 'high'])
+  sensitivity?: 'low' | 'medium' | 'high';
+
+  @IsOptional()
+  @IsIn(['narrow', 'normal', 'wide'])
+  scope?: 'narrow' | 'normal' | 'wide';
 }
+
+export type SearchSensitivity = 'low' | 'medium' | 'high';
+export type SearchScope = 'narrow' | 'normal' | 'wide';
 
 export class UpdateQueryDto {
   @IsOptional()

@@ -9,10 +9,12 @@ import {
   Patch,
   Post,
   Req,
+  Res,
   UploadedFile,
   UseInterceptors,
 } from '@nestjs/common';
 import { FileInterceptor } from '@nestjs/platform-express';
+import type { Response } from 'express';
 
 import type { AuthenticatedRequest } from '../../common/types.js';
 import {
@@ -41,6 +43,39 @@ export class SourcesController {
   @Get(':id')
   async get(@Req() request: AuthenticatedRequest, @Param('id') id: string) {
     return this.sourcesService.get(request.identity, id);
+  }
+
+  @Get(':id/download')
+  async download(
+    @Req() request: AuthenticatedRequest,
+    @Param('id') id: string,
+    @Headers('range') range: string | undefined,
+    @Headers('x-internal-token') token: string | undefined,
+    @Res() res: Response,
+  ) {
+    const file = await this.sourcesService.download(
+      request.identity,
+      id,
+      range,
+      token,
+    );
+    res.status(file.status);
+    res.setHeader('Content-Type', file.contentType);
+    res.setHeader('Content-Length', file.contentLength);
+    res.setHeader(
+      'Content-Disposition',
+      `inline; filename="${encodeURIComponent(file.fileName)}"`,
+    );
+    res.setHeader('Accept-Ranges', file.acceptRanges || 'bytes');
+    if (file.contentRange) {
+      res.setHeader('Content-Range', file.contentRange);
+    }
+    res.send(file.buffer);
+  }
+
+  @Get(':id/file-url')
+  async fileUrl(@Req() request: AuthenticatedRequest, @Param('id') id: string) {
+    return this.sourcesService.getFileUrl(request.identity, id);
   }
 
   @Get(':id/progress')
