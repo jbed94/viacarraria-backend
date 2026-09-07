@@ -81,22 +81,26 @@ export class BillingService {
   async webhook(
     signature: string | undefined,
     payload: unknown,
+    rawBody?: Buffer,
   ): Promise<{ received: boolean }> {
     const secret = this.config.get<string>('LEMON_SQUEEZY_WEBHOOK_SECRET');
-    const serialized = JSON.stringify(payload);
-    if (secret) {
-      const expected = createHmac('sha256', secret)
-        .update(serialized)
-        .digest('hex');
-      if (
-        !signature ||
-        signature.length !== expected.length ||
-        !timingSafeEqual(Buffer.from(signature), Buffer.from(expected))
-      ) {
-        throw new ForbiddenException('Invalid billing webhook signature.');
-      }
-    } else if (this.config.get<string>('NODE_ENV') === 'production') {
+    if (!secret) {
       throw new ForbiddenException('Billing webhook is not configured.');
+    }
+
+    const dataToVerify = rawBody ?? Buffer.from(JSON.stringify(payload));
+    const expected = createHmac('sha256', secret)
+      .update(dataToVerify)
+      .digest('hex');
+    if (
+      !signature ||
+      signature.length !== expected.length ||
+      !timingSafeEqual(
+        Buffer.from(signature, 'utf8'),
+        Buffer.from(expected, 'utf8'),
+      )
+    ) {
+      throw new ForbiddenException('Invalid billing webhook signature.');
     }
 
     const event = payload as {

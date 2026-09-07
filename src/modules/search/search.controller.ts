@@ -1,3 +1,4 @@
+import { timingSafeEqual } from 'node:crypto';
 import { Body, Controller, Get, Param, Patch, Post, Req } from '@nestjs/common';
 
 import type { AuthenticatedRequest } from '../../common/types.js';
@@ -39,7 +40,13 @@ export class SearchController {
   ) {
     const internalToken = request.headers['x-internal-token'];
     const expectedToken = process.env.INTERNAL_SERVICE_TOKEN;
-    if (internalToken && expectedToken && internalToken === expectedToken) {
+    const isInternalValid =
+      typeof internalToken === 'string' &&
+      typeof expectedToken === 'string' &&
+      internalToken.length === expectedToken.length &&
+      timingSafeEqual(Buffer.from(internalToken), Buffer.from(expectedToken));
+
+    if (isInternalValid) {
       return this.searchService.indexGraphSources(id);
     }
     return this.searchService.indexGraph(request.identity, id);

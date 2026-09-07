@@ -21,7 +21,14 @@ export class RedisService implements OnModuleInit, OnModuleDestroy {
       enableOfflineQueue: false,
       lazyConnect: true,
       maxRetriesPerRequest: 1,
-      retryStrategy: () => null,
+      retryStrategy: (times) => Math.min(times * 200, 3000),
+    });
+    this.client.on('connect', () => {
+      this.available = true;
+      this.logger.log('Connected to Redis');
+    });
+    this.client.on('ready', () => {
+      this.available = true;
     });
     this.client.on('error', (error: Error) => {
       this.logger.warn(`Redis unavailable: ${error.message}`);
@@ -149,10 +156,14 @@ export class RedisService implements OnModuleInit, OnModuleDestroy {
     return this.readCounter(key);
   }
 
-  async set(key: string, value: string, ttlSeconds: number): Promise<void> {
+  async set(key: string, value: string, ttlSeconds?: number): Promise<void> {
     if (this.available) {
       try {
-        await this.client.set(key, value, 'EX', ttlSeconds);
+        if (ttlSeconds && ttlSeconds > 0) {
+          await this.client.set(key, value, 'EX', ttlSeconds);
+        } else {
+          await this.client.set(key, value);
+        }
         return;
       } catch (error: unknown) {
         this.available = false;
@@ -161,7 +172,10 @@ export class RedisService implements OnModuleInit, OnModuleDestroy {
     }
     this.localValues.set(key, {
       value,
-      expiresAt: Date.now() + ttlSeconds * 1000,
+      expiresAt:
+        ttlSeconds && ttlSeconds > 0
+          ? Date.now() + ttlSeconds * 1000
+          : Number.MAX_SAFE_INTEGER,
     });
   }
 
@@ -180,11 +194,14 @@ export class RedisService implements OnModuleInit, OnModuleDestroy {
   private async increment(key: string, ttlSeconds: number): Promise<number> {
     if (this.available) {
       try {
-        const count = await this.client.incr(key);
-        if (count === 1) {
-          await this.client.expire(key, ttlSeconds);
+        const results = await this.client
+          .pipeline()
+          .incr(key)
+          .expire(key, ttlSeconds)
+          .exec();
+        if (results && results[0] && results[0][1] !== null) {
+          return Number(results[0][1]);
         }
-        return count;
       } catch (error: unknown) {
         this.available = false;
         this.logger.warn(`Redis counter fallback: ${this.message(error)}`);
@@ -199,6 +216,108 @@ export class RedisService implements OnModuleInit, OnModuleDestroy {
     const value = await this.get(key);
     const count = Number.parseInt(value ?? '0', 10);
     return Number.isFinite(count) ? count : 0;
+  }
+
+  createSubscriber(): Redis | null {
+    if (!this.available) {
+      return null;
+    }
+    return this.client.duplicate();
+  }
+
+  async publish(channel: string, message: string): Promise<number> {
+    if (this.available) {
+      try {
+        return await this.client.publish(channel, message);
+      } catch (error: unknown) {
+        this.logger.warn(`Redis publish fallback: ${this.message(error)}`);
+      }
+    }
+    return 0;
+  }
+
+  async del(key: string): Promise<number> {
+    if (this.available) {
+      try {
+        return await this.client.del(key);
+      } catch (error: unknown) {
+        this.logger.warn(`Redis del fallback: ${this.message(error)}`);
+      }
+    }
+    const had = this.localValues.delete(key);
+    return had ? 1 : 0;
+  }
+
+  async lpush(key: string, value: string): Promise<number> {
+    if (this.available) {
+      try {
+        return await this.client.lpush(key, value);
+      } catch (error: unknown) {
+        this.logger.warn(`Redis lpush fallback: ${this.message(error)}`);
+      }
+    }
+    const existing = this.readLocalList(key);
+    existing.unshift(value);
+    this.localValues.set(key, {
+      value: JSON.stringify(existing),
+      expiresAt: Number.MAX_SAFE_INTEGER,
+    });
+    return existing.length;
+  }
+
+  async ltrim(key: string, start: number, stop: number): Promise<string> {
+    if (this.available) {
+      try {
+        return await this.client.ltrim(key, start, stop);
+      } catch (error: unknown) {
+        this.logger.warn(`Redis ltrim fallback: ${this.message(error)}`);
+      }
+    }
+    const existing = this.readLocalList(key);
+    const end = stop < 0 ? existing.length + stop + 1 : stop + 1;
+    const trimmed = existing.slice(start, end);
+    this.localValues.set(key, {
+      value: JSON.stringify(trimmed),
+      expiresAt: Number.MAX_SAFE_INTEGER,
+    });
+    return 'OK';
+  }
+
+  async lrange(key: string, start: number, stop: number): Promise<string[]> {
+    if (this.available) {
+      try {
+        return await this.client.lrange(key, start, stop);
+      } catch (error: unknown) {
+        this.logger.warn(`Redis lrange fallback: ${this.message(error)}`);
+      }
+    }
+    const existing = this.readLocalList(key);
+    const end = stop < 0 ? existing.length + stop + 1 : stop + 1;
+    return existing.slice(start, end);
+  }
+
+  async llen(key: string): Promise<number> {
+    if (this.available) {
+      try {
+        return await this.client.llen(key);
+      } catch (error: unknown) {
+        this.logger.warn(`Redis llen fallback: ${this.message(error)}`);
+      }
+    }
+    return this.readLocalList(key).length;
+  }
+
+  private readLocalList(key: string): string[] {
+    const value = this.localValues.get(key);
+    if (!value || value.expiresAt <= Date.now()) {
+      return [];
+    }
+    try {
+      const parsed = JSON.parse(value.value);
+      return Array.isArray(parsed) ? parsed : [];
+    } catch {
+      return [];
+    }
   }
 
   private readLocalSet(key: string): Set<string> {

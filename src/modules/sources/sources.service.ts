@@ -7,7 +7,7 @@ import {
   UnsupportedMediaTypeException,
 } from '@nestjs/common';
 import { ConfigService } from '@nestjs/config';
-import { createHash, randomUUID } from 'crypto';
+import { createHash, randomUUID, timingSafeEqual } from 'crypto';
 import { existsSync } from 'fs';
 import { readFile } from 'fs/promises';
 import { basename, extname, join } from 'path';
@@ -21,6 +21,9 @@ import type { ViewerIdentity } from '../../common/types.js';
 import { AuthService } from '../auth/auth.service.js';
 import { GraphsService, type SourceSummary } from '../graphs/graphs.service.js';
 import type {
+  AbortUploadDto,
+  CompleteUploadDto,
+  PresignedUploadDto,
   UpdateSourceStatusDto,
   UploadedDocument,
   UploadSourceDto,
@@ -52,6 +55,18 @@ export class SourcesService {
     this.uploadDirectory =
       config.get<string>('UPLOAD_DIR') ?? join(process.cwd(), 'uploads');
     this.internalToken = config.getOrThrow<string>('INTERNAL_SERVICE_TOKEN');
+  }
+
+  private isValidInternalToken(token: string | undefined): boolean {
+    if (!token || typeof token !== 'string' || !this.internalToken) {
+      return false;
+    }
+    const tokenBuffer = Buffer.from(token);
+    const expectedBuffer = Buffer.from(this.internalToken);
+    if (tokenBuffer.length !== expectedBuffer.length) {
+      return false;
+    }
+    return timingSafeEqual(tokenBuffer, expectedBuffer);
   }
 
   async upload(
@@ -121,6 +136,15 @@ export class SourcesService {
       fileType,
     );
     const fileUrl = stored.location;
+    if (stored.storageDriver === 's3') {
+      void this.storage
+        .putObjectTagging(storageKey, {
+          Tier: viewer.tier,
+          GraphId: graph.id,
+          SourceId: sourceId,
+        })
+        .catch(() => undefined);
+    }
 
     const content = fileType.startsWith('text/')
       ? file.buffer.toString('utf8')
@@ -176,6 +200,250 @@ export class SourcesService {
     return source;
   }
 
+  async presignedUpload(
+    identity: ViewerIdentity | undefined,
+    dto: PresignedUploadDto,
+  ): Promise<{
+    sourceId: string;
+    jobId: string;
+    storageKey: string;
+    storageDriver: string;
+    isMultipart: boolean;
+    uploadUrl?: string;
+    headers?: Record<string, string>;
+    uploadId?: string;
+    parts?: Array<{
+      uploadUrl: string;
+      partNumber: number;
+      headers: Record<string, string>;
+    }>;
+  }> {
+    const viewer = this.auth.requireRegistered(
+      this.auth.requireIdentity(identity),
+    );
+    const graph = await this.graphs.findEditable(viewer, dto.graphId);
+    this.authorization.assertCan(viewer, 'upload', 'Source', {
+      graphUserId: graph.userId,
+      graphIsPublic: graph.isPublic,
+    });
+    if (!graph.nodes.some((node) => node.id === dto.nodeId)) {
+      throw new NotFoundException(
+        'The selected node does not exist in this graph.',
+      );
+    }
+    const uploadQuota = await this.redis.consumeUploadQuota(viewer.userId);
+    if (!uploadQuota.allowed) {
+      throw new HttpException(
+        'Upload limit reached. Try again next hour.',
+        HttpStatus.TOO_MANY_REQUESTS,
+      );
+    }
+    const maxBytes =
+      viewer.tier === 'FREE' ? 2 * 1024 * 1024 : 1024 * 1024 * 1024;
+    if (dto.fileSize > maxBytes) {
+      throw new ForbiddenException(
+        `Files are limited to ${maxBytes / 1024 / 1024} MB for your plan.`,
+      );
+    }
+    if (viewer.tier === 'FREE' && dto.fileType === 'application/pdf') {
+      throw new ForbiddenException('PDF uploads require a Pro subscription.');
+    }
+    if (viewer.tier === 'FREE') {
+      const count = await this.database.one<{ count: string }>(
+        'SELECT COUNT(*)::text AS "count" FROM "NodeSource" WHERE "graphId" = $1 AND "nodeId" = $2',
+        [graph.id, dto.nodeId],
+      );
+      if (Number(count?.count ?? '0') >= 3) {
+        throw new ForbiddenException(
+          'Free graphs allow three source documents per node.',
+        );
+      }
+    }
+
+    const sourceId = randomUUID();
+    const jobId = randomUUID();
+    const extension =
+      extname(dto.fileName).toLowerCase() || this.extensionFor(dto.fileType);
+    const fileName = `${sourceId}${extension}`;
+    const storageKey = `sources/${graph.id}/${sourceId}/${fileName}`;
+
+    const presigned = await this.storage.getPresignedUploadUrl({
+      key: storageKey,
+      contentType: dto.fileType,
+      fileSize: dto.fileSize,
+      isMultipart: dto.isMultipart ?? false,
+      partCount: dto.partCount,
+      checksumSha256: dto.checksumSha256,
+    });
+
+    return {
+      sourceId,
+      jobId,
+      storageKey: presigned.key,
+      storageDriver: presigned.storageDriver,
+      isMultipart: presigned.isMultipart,
+      uploadUrl: presigned.uploadUrl,
+      headers: presigned.headers,
+      uploadId: presigned.uploadId,
+      parts: presigned.parts,
+    };
+  }
+
+  async completeUpload(
+    identity: ViewerIdentity | undefined,
+    dto: CompleteUploadDto,
+  ): Promise<SourceSummary> {
+    const viewer = this.auth.requireRegistered(
+      this.auth.requireIdentity(identity),
+    );
+    const graph = await this.graphs.findEditable(viewer, dto.graphId);
+    this.authorization.assertCan(viewer, 'upload', 'Source', {
+      graphUserId: graph.userId,
+      graphIsPublic: graph.isPublic,
+    });
+    if (!graph.nodes.some((node) => node.id === dto.nodeId)) {
+      throw new NotFoundException(
+        'The selected node does not exist in this graph.',
+      );
+    }
+
+    if (dto.uploadId && dto.parts && dto.parts.length > 0) {
+      await this.storage.completeMultipartUpload(
+        dto.storageKey,
+        dto.uploadId,
+        dto.parts,
+      );
+    }
+
+    const head = await this.storage.headObject(dto.storageKey);
+    if (!head.exists) {
+      throw new NotFoundException('Uploaded file not found in storage.');
+    }
+
+    let fileHash = dto.checksumSha256?.toLowerCase();
+    let content: string | null = null;
+    const finalSize = head.contentLength || dto.fileSize;
+    const isSmallFile = (head.contentLength ?? 0) <= 2 * 1024 * 1024;
+    const isTextFile = dto.fileType.startsWith('text/');
+
+    if (isSmallFile && (!fileHash || isTextFile)) {
+      const objectData = await this.storage.getObject(dto.storageKey);
+      const computedHash = createHash('sha256')
+        .update(objectData.buffer)
+        .digest('hex');
+      if (fileHash && computedHash.toLowerCase() !== fileHash) {
+        await this.storage.deleteObject(dto.storageKey);
+        throw new HttpException(
+          'File checksum validation failed. Corrupted upload.',
+          HttpStatus.BAD_REQUEST,
+        );
+      }
+      fileHash = computedHash;
+      if (isTextFile) {
+        content = objectData.buffer.toString('utf8');
+      }
+    } else if (!fileHash) {
+      fileHash =
+        head.eTag || createHash('sha256').update(dto.storageKey).digest('hex');
+    }
+
+    const fileUrl =
+      this.storage.getDriver() === 's3'
+        ? `s3://${this.storage.getBucketName()}/${dto.storageKey}`
+        : join(this.uploadDirectory, basename(dto.storageKey));
+
+    if (this.storage.getDriver() === 's3') {
+      void this.storage
+        .putObjectTagging(dto.storageKey, {
+          Tier: viewer.tier,
+          GraphId: graph.id,
+          SourceId: dto.sourceId,
+        })
+        .catch(() => undefined);
+    }
+
+    let source: SourceRecord | undefined;
+    try {
+      [source] = await this.database.query<SourceRecord>(
+        `INSERT INTO "NodeSource" (
+           "id", "nodeId", "graphId", "name", "fileType", "fileUrl", "fileHash", "sizeBytes", "status", "jobId", "content", "updatedAt"
+         ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, 'PENDING', $9, $10, CURRENT_TIMESTAMP)
+         RETURNING "id", "nodeId", "graphId", "name", "fileType", "fileUrl", "sizeBytes", "status", "jobId", "content", "error", "createdAt", "updatedAt"`,
+        [
+          dto.sourceId,
+          dto.nodeId,
+          graph.id,
+          basename(dto.fileName),
+          dto.fileType,
+          fileUrl,
+          fileHash,
+          finalSize,
+          dto.jobId,
+          content,
+        ],
+      );
+      await this.redis.set(`JOB_${dto.jobId}:PROGRESS`, '0', 3600);
+      this.progressGateway.emitUpdate({
+        sourceId: dto.sourceId,
+        graphId: graph.id,
+        nodeId: dto.nodeId,
+        status: 'PENDING',
+        progress: 0,
+      });
+      await this.rabbitMq.publishParsingJob({
+        jobId: dto.jobId,
+        sourceId: dto.sourceId,
+        graphId: graph.id,
+        nodeId: dto.nodeId,
+        filePath: fileUrl,
+        fileName: source?.name ?? dto.fileName,
+        fileHash,
+        priority: viewer.tier === 'PRO' ? 10 : 1,
+      });
+    } catch (error: unknown) {
+      await this.database.query('DELETE FROM "NodeSource" WHERE "id" = $1', [
+        dto.sourceId,
+      ]);
+      await this.storage.deleteObject(dto.storageKey);
+      throw error;
+    }
+
+    if (!source) {
+      throw new NotFoundException('Source could not be created.');
+    }
+    return source;
+  }
+
+  async abortUpload(
+    identity: ViewerIdentity | undefined,
+    dto: AbortUploadDto,
+  ): Promise<void> {
+    this.auth.requireRegistered(this.auth.requireIdentity(identity));
+    if (dto.uploadId) {
+      await this.storage.abortMultipartUpload(dto.storageKey, dto.uploadId);
+    }
+    await this.storage.deleteObject(dto.storageKey);
+  }
+
+  async handleDirectUpload(
+    key: string,
+    buffer: Buffer,
+    uploadId?: string,
+    partNumber?: number,
+  ): Promise<{ success: boolean; eTag?: string; partNumber?: number }> {
+    if (uploadId && partNumber) {
+      const part = await this.storage.saveLocalPart(
+        uploadId,
+        partNumber,
+        buffer,
+      );
+      return { success: true, eTag: part.eTag, partNumber: part.partNumber };
+    }
+    await this.storage.putObject(key, buffer);
+    const eTag = createHash('md5').update(buffer).digest('hex');
+    return { success: true, eTag };
+  }
+
   async get(
     identity: ViewerIdentity | undefined,
     sourceId: string,
@@ -189,7 +457,7 @@ export class SourcesService {
     if (!source) {
       throw new NotFoundException('Source not found.');
     }
-    if (!token || token !== this.internalToken) {
+    if (!this.isValidInternalToken(token)) {
       const graph = await this.graphs.findAccessible(identity, source.graphId);
       this.authorization.assertCan(identity, 'read', 'Source', {
         graphUserId: graph.userId,
@@ -367,7 +635,7 @@ export class SourcesService {
     sourceId: string,
     dto: UpdateSourceStatusDto,
   ): Promise<SourceRecord> {
-    if (!token || token !== this.internalToken) {
+    if (!this.isValidInternalToken(token)) {
       throw new ForbiddenException('Invalid internal service token.');
     }
     const [source] = await this.database.query<SourceRecord>(

@@ -89,7 +89,7 @@ export class SearchService implements OnApplicationBootstrap {
       }
 
       const systemGraphs = await this.database.query<{ id: string }>(
-        `SELECT "id" FROM "Graph" WHERE "id" LIKE 'system-%' OR "slug" IN ('medicine', 'computer-science', 'finance')`,
+        `SELECT "id" FROM "Graph" WHERE "id" LIKE 'system-%'`,
       );
 
       for (const graph of systemGraphs) {
@@ -106,8 +106,10 @@ export class SearchService implements OnApplicationBootstrap {
           );
         }
       }
-    } catch {
-      // Non-blocking: background warmup should not fail startup
+    } catch (error: unknown) {
+      this.logger.warn(
+        `Background Weaviate warmup encountered an error: ${String(error)}`,
+      );
     }
   }
 

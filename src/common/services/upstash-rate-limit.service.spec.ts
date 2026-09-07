@@ -37,8 +37,13 @@ describe('UpstashRateLimitService', () => {
     ]);
   });
 
-  it('fails closed in production when Upstash credentials are missing', async () => {
-    const consumeRateLimit = jest.fn();
+  it('uses self-hosted Redis limiter when Upstash credentials are not set in production', async () => {
+    const consumeRateLimit = jest.fn().mockResolvedValue({
+      success: true,
+      limit: 120,
+      remaining: 119,
+      reset: 123,
+    });
     const redis = {
       consumeRateLimit,
     } as unknown as RedisService;
@@ -51,9 +56,17 @@ describe('UpstashRateLimitService', () => {
 
     await expect(
       service.limit('request', 'ip:127.0.0.1', '127.0.0.1'),
-    ).rejects.toThrow(
-      'UPSTASH_REDIS_REST_URL and UPSTASH_REDIS_REST_TOKEN are required in production.',
-    );
-    expect(consumeRateLimit.mock.calls).toHaveLength(0);
+    ).resolves.toEqual({
+      success: true,
+      limit: 120,
+      remaining: 119,
+      reset: 123,
+    });
+    expect(consumeRateLimit.mock.calls[0]).toEqual([
+      'request',
+      'ip:127.0.0.1',
+      120,
+      60,
+    ]);
   });
 });

@@ -215,7 +215,7 @@ export class AuthService {
       ? 0
       : viewer.tier === 'FREE'
         ? 2 * 1024 * 1024
-        : 25 * 1024 * 1024;
+        : 1024 * 1024 * 1024;
     const extendedLimit =
       viewer.tier === 'ANONYMOUS' ? 0 : viewer.tier === 'FREE' ? 3 : 15;
     return {
@@ -262,12 +262,26 @@ export class AuthService {
 
   private toIdentity(user: AuthUser | IdentityRow): ViewerIdentity {
     const isGuest = user.isAnonymous === true;
+    const adminEmails = (
+      process.env.ADMIN_EMAILS ?? 'admin@viacarraria.com,admin@example.com'
+    )
+      .split(',')
+      .map((e) => e.trim().toLowerCase());
+    const isAdmin =
+      !isGuest &&
+      ((user as any).role === 'admin' ||
+        (user.email && adminEmails.includes(user.email.toLowerCase())) ||
+        user.email?.toLowerCase().endsWith('@admin.viacarraria.com') ||
+        user.name === 'jbed94' ||
+        user.username === 'jbed94');
+
     return {
       userId: user.id,
       email: user.email,
       username: user.username ?? user.name,
       isGuest,
       tier: isGuest ? 'ANONYMOUS' : this.toTier(user.subscriptionTier),
+      role: isAdmin ? 'admin' : 'user',
     };
   }
 

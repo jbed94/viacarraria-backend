@@ -1,4 +1,5 @@
 import { Body, Controller, Get, Headers, Post, Req } from '@nestjs/common';
+import type { Request } from 'express';
 
 import type { AuthenticatedRequest } from '../../common/types.js';
 import { CheckoutDto } from './billing.dto.js';
@@ -23,9 +24,11 @@ export class BillingController {
 
   @Post('webhook')
   async webhook(
+    @Req() request: Request,
     @Headers('x-signature') signature: string | undefined,
     @Body() payload: unknown,
   ) {
-    return this.billingService.webhook(signature, payload);
+    const rawBody = (request as unknown as { rawBody?: Buffer }).rawBody;
+    return this.billingService.webhook(signature, payload, rawBody);
   }
 }

@@ -60,7 +60,11 @@ describe('WeaviateService - Batch Ingestion', () => {
           50, 44, 300, 20,
         ]);
         expect(body.objects[0]?.properties.elementType).toBe('heading');
-        return Promise.resolve({ ok: true, status: 200 });
+        return Promise.resolve({
+          ok: true,
+          status: 200,
+          json: () => Promise.resolve([]),
+        });
       }
       return Promise.resolve({ ok: true, status: 200 });
     });
@@ -101,5 +105,176 @@ describe('WeaviateService - Batch Ingestion', () => {
 
     const indexedCount = await service.upsertBatch(chunks, vectors);
     expect(indexedCount).toBe(2);
+  });
+
+  it('performs hybridSearch with single nodeId using Equal pre-filter', async () => {
+    mockFetch.mockImplementation((url: string, init?: RequestInit) => {
+      const urlStr = url.toString();
+      if (urlStr.includes('/v1/schema/Chunk')) {
+        return Promise.resolve({
+          ok: true,
+          status: 200,
+          json: () => Promise.resolve({ properties: [{ name: 'pageNum' }] }),
+        });
+      }
+      if (urlStr.includes('/v1/graphql')) {
+        const body = JSON.parse(init?.body as string) as { query: string };
+        expect(body.query).toContain('tenant: "graph-test"');
+        expect(body.query).toContain('path: ["nodeId"]');
+        expect(body.query).toContain('operator: Equal');
+        expect(body.query).toContain('valueText: "node-1"');
+        return Promise.resolve({
+          ok: true,
+          status: 200,
+          json: () =>
+            Promise.resolve({
+              data: {
+                Get: {
+                  Chunk: [
+                    {
+                      graphId: 'graph-test',
+                      sourceId: 'src-1',
+                      sourceName: 'Syllabus.pdf',
+                      nodeId: 'node-1',
+                      content: 'Consensus algorithms in distributed systems.',
+                      context: 'Full consensus algorithms context.',
+                      startChar: 0,
+                      endChar: 40,
+                      pageNum: 1,
+                      _additional: { score: '0.92', vector: [0.1, 0.2, 0.3] },
+                    },
+                  ],
+                },
+              },
+            }),
+        });
+      }
+      return Promise.resolve({ ok: true, status: 200 });
+    });
+
+    const results = await service.hybridSearch(
+      'graph-test',
+      'consensus',
+      ['node-1'],
+      [0.1, 0.2, 0.3],
+      10,
+    );
+
+    expect(results).toHaveLength(1);
+    expect(results[0]?.nodeId).toBe('node-1');
+    expect(results[0]?.score).toBe(0.92);
+    expect(results[0]?.vector).toEqual([0.1, 0.2, 0.3]);
+  });
+
+  it('performs hybridSearch with multiple nodeIds using ContainsAny pre-filter', async () => {
+    mockFetch.mockImplementation((url: string, init?: RequestInit) => {
+      const urlStr = url.toString();
+      if (urlStr.includes('/v1/schema/Chunk')) {
+        return Promise.resolve({
+          ok: true,
+          status: 200,
+          json: () => Promise.resolve({ properties: [{ name: 'pageNum' }] }),
+        });
+      }
+      if (urlStr.includes('/v1/graphql')) {
+        const body = JSON.parse(init?.body as string) as { query: string };
+        expect(body.query).toContain('operator: ContainsAny');
+        expect(body.query).toContain('valueText: ["node-1","node-2"]');
+        return Promise.resolve({
+          ok: true,
+          status: 200,
+          json: () =>
+            Promise.resolve({
+              data: {
+                Get: {
+                  Chunk: [
+                    {
+                      graphId: 'graph-test',
+                      sourceId: 'src-1',
+                      sourceName: 'Syllabus.pdf',
+                      nodeId: 'node-2',
+                      content: 'Raft protocol states and heartbeat timers.',
+                      context: 'Raft protocol states context.',
+                      startChar: 50,
+                      endChar: 95,
+                      pageNum: 2,
+                      _additional: { score: '0.88' },
+                    },
+                  ],
+                },
+              },
+            }),
+        });
+      }
+      return Promise.resolve({ ok: true, status: 200 });
+    });
+
+    const results = await service.hybridSearch(
+      'graph-test',
+      'raft',
+      ['node-1', 'node-2'],
+      [0.1, 0.2, 0.3],
+      10,
+    );
+
+    expect(results).toHaveLength(1);
+    expect(results[0]?.nodeId).toBe('node-2');
+    expect(results[0]?.score).toBe(0.88);
+  });
+
+  it('performs vectorSearch using pre-filter and strips vector property', async () => {
+    mockFetch.mockImplementation((url: string, init?: RequestInit) => {
+      const urlStr = url.toString();
+      if (urlStr.includes('/v1/schema/Chunk')) {
+        return Promise.resolve({
+          ok: true,
+          status: 200,
+          json: () => Promise.resolve({ properties: [{ name: 'pageNum' }] }),
+        });
+      }
+      if (urlStr.includes('/v1/graphql')) {
+        const body = JSON.parse(init?.body as string) as { query: string };
+        expect(body.query).toContain('nearVector:');
+        expect(body.query).toContain('operator: Equal');
+        expect(body.query).toContain('valueText: "adjacent-node"');
+        return Promise.resolve({
+          ok: true,
+          status: 200,
+          json: () =>
+            Promise.resolve({
+              data: {
+                Get: {
+                  Chunk: [
+                    {
+                      graphId: 'graph-test',
+                      sourceId: 'src-2',
+                      sourceName: 'Paxos.pdf',
+                      nodeId: 'adjacent-node',
+                      content: 'Paxos consensus quorum mechanics.',
+                      context: 'Paxos context.',
+                      startChar: 0,
+                      endChar: 35,
+                      pageNum: 3,
+                      _additional: { score: '0.79' },
+                    },
+                  ],
+                },
+              },
+            }),
+        });
+      }
+      return Promise.resolve({ ok: true, status: 200 });
+    });
+
+    const results = await service.vectorSearch(
+      'graph-test',
+      [0.1, 0.2, 0.3],
+      ['adjacent-node'],
+      5,
+    );
+
+    expect(results).toHaveLength(1);
+    expect(results[0]?.nodeId).toBe('adjacent-node');
+    expect((results[0] as { vector?: unknown }).vector).toBeUndefined();
   });
 });

@@ -8,13 +8,14 @@ if (!databaseUrl) {
 }
 
 const betterAuthSecret = process.env.BETTER_AUTH_SECRET;
-if (process.env.NODE_ENV === 'production' && !betterAuthSecret) {
-  throw new Error('BETTER_AUTH_SECRET is required in production.');
+if (!betterAuthSecret) {
+  throw new Error('BETTER_AUTH_SECRET is required to configure Better Auth.');
 }
 
+const poolSize = Number.parseInt(process.env.DATABASE_POOL_SIZE ?? '30', 10);
 export const authDatabase = new Pool({
   connectionString: databaseUrl,
-  max: 10,
+  max: Number.isFinite(poolSize) && poolSize > 0 ? poolSize : 30,
 });
 
 const googleClientId = process.env.GOOGLE_CLIENT_ID;
@@ -33,9 +34,7 @@ const googleProvider =
 export const auth = betterAuth({
   baseURL: process.env.BETTER_AUTH_URL ?? 'http://localhost:3000',
   basePath: '/api/auth',
-  secret:
-    betterAuthSecret ??
-    'local-development-better-auth-secret-change-me-32-chars',
+  secret: betterAuthSecret,
   trustedOrigins: (
     process.env.FRONTEND_ORIGIN ?? 'http://localhost:4173'
   ).split(','),

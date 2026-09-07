@@ -10,7 +10,10 @@ import {
   Put,
   Query,
   Req,
+  Res,
+  StreamableFile,
 } from '@nestjs/common';
+import type { Response } from 'express';
 
 import type { AuthenticatedRequest } from '../../common/types.js';
 import {
@@ -37,6 +40,28 @@ export class GraphsController {
     @Query('search') search?: string,
   ) {
     return this.graphsService.listPublic(request.identity, search);
+  }
+
+  @Get(':id/archive')
+  async downloadArchive(
+    @Req() request: AuthenticatedRequest,
+    @Param('id') id: string,
+    @Res({ passthrough: true }) res: Response,
+  ): Promise<StreamableFile> {
+    return this.graphsService.downloadArchive(request.identity, id, res);
+  }
+
+  @Post('archives/:id/restore')
+  async restoreArchive(
+    @Req() request: AuthenticatedRequest,
+    @Param('id') id: string,
+  ) {
+    return this.graphsService.restoreArchive(request.identity, id);
+  }
+
+  @Post(':id/restore')
+  async restore(@Req() request: AuthenticatedRequest, @Param('id') id: string) {
+    return this.graphsService.restoreArchive(request.identity, id);
   }
 
   @Get(':id')
@@ -112,6 +137,14 @@ export class GraphsController {
     @Body() dto: CopyGraphDto,
   ) {
     return this.graphsService.copy(request.identity, id, dto);
+  }
+
+  @Post(':id/keep-active')
+  async keepActive(
+    @Req() request: AuthenticatedRequest,
+    @Param('id') id: string,
+  ) {
+    return this.graphsService.keepActive(request.identity, id);
   }
 
   @HttpCode(204)

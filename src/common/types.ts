@@ -8,6 +8,7 @@ export type ViewerIdentity = {
   email: string | null;
   username: string | null;
   isGuest: boolean;
+  role?: 'admin' | 'user';
 };
 
 export type GraphPermission = 'OWNER' | 'VIEWER';

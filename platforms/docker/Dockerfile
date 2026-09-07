@@ -8,11 +8,14 @@ FROM dependencies AS build
 COPY . .
 RUN pnpm build
 
+FROM build AS pruned
+RUN pnpm prune --prod
+
 FROM node:22-alpine AS runtime
 ENV NODE_ENV=production
 WORKDIR /app
 RUN corepack enable
-COPY --from=dependencies /app/node_modules ./node_modules
+COPY --from=pruned /app/node_modules ./node_modules
 COPY --from=build /app/dist ./dist
 COPY package.json ./
 RUN mkdir -p /data/uploads && chown -R node:node /data

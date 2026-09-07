@@ -2,15 +2,20 @@ import {
   ForbiddenException,
   Injectable,
   NotFoundException,
+  StreamableFile,
 } from '@nestjs/common';
 import { ConfigService } from '@nestjs/config';
 import { randomUUID } from 'crypto';
+import type { Response } from 'express';
+import { existsSync } from 'fs';
 import { copyFile, mkdir, rm } from 'fs/promises';
 import { extname, join } from 'path';
 
 import { validateCanvas } from '../../common/canvas.js';
 import { AuthorizationService } from '../../common/authorization/ability.js';
 import { DatabaseService } from '../../common/services/database.service.js';
+import { StorageService } from '../../common/services/storage.service.js';
+import { WeaviateService } from '../../common/services/weaviate.service.js';
 import type {
   CanvasEdge,
   CanvasNode,
@@ -18,6 +23,7 @@ import type {
   ViewerIdentity,
 } from '../../common/types.js';
 import { AuthService } from '../auth/auth.service.js';
+import { GraphRetentionService } from './graph-retention.service.js';
 import type {
   CopyGraphDto,
   CreateGraphDto,
@@ -34,6 +40,9 @@ export type GraphRecord = {
   isPrepared: boolean;
   nodes: CanvasNode[];
   edges: CanvasEdge[];
+  lastAccessedAt?: Date;
+  scheduledForDeletionAt?: Date | null;
+  isExemptFromRetention?: boolean;
   createdAt: Date;
   updatedAt: Date;
 };
@@ -69,8 +78,10 @@ export type PublicGraphSummary = {
   viewerCount: number;
   nodeCount: number;
   sourceCount: number;
+  lastAccessedAt?: Date;
+  scheduledForDeletionAt?: Date | null;
+  isExemptFromRetention?: boolean;
   createdAt: Date;
-  updatedAt: Date;
 };
 
 type CopySourceRecord = SourceSummary & {
@@ -86,6 +97,9 @@ export class GraphsService {
     private readonly auth: AuthService,
     private readonly authorization: AuthorizationService,
     config: ConfigService,
+    private readonly storage?: StorageService,
+    private readonly weaviate?: WeaviateService,
+    private readonly retentionService?: GraphRetentionService,
   ) {
     this.uploadDirectory =
       config.get<string>('UPLOAD_DIR') ?? join(process.cwd(), 'uploads');
@@ -93,14 +107,29 @@ export class GraphsService {
 
   private readonly uploadDirectory: string;
 
+  async touchAccess(graphId: string): Promise<void> {
+    try {
+      await this.database.query(
+        `UPDATE "Graph"
+         SET "lastAccessedAt" = CURRENT_TIMESTAMP,
+             "scheduledForDeletionAt" = NULL
+         WHERE "id" = $1
+           AND ("lastAccessedAt" < CURRENT_TIMESTAMP - INTERVAL '15 minutes' OR "scheduledForDeletionAt" IS NOT NULL)`,
+        [graphId],
+      );
+    } catch {
+      // Non-blocking
+    }
+  }
+
   async list(identity: ViewerIdentity | undefined): Promise<GraphResponse[]> {
     const userId = identity?.userId ?? '';
     const graphs = await this.database.query<GraphRecord>(
-      `SELECT g."id", g."title", g."description", g."userId", g."isPublic", g."isPrepared", g."nodes", g."edges", g."createdAt", g."updatedAt"
+      `SELECT g."id", g."title", g."description", g."userId", g."isPublic", g."isPrepared", g."nodes", g."edges", g."lastAccessedAt", g."scheduledForDeletionAt", g."isExemptFromRetention", g."createdAt", g."updatedAt"
        FROM "Graph" g
        WHERE g."userId" = $1
           OR (g."isPublic" = true AND EXISTS (SELECT 1 FROM "GraphAttachment" a WHERE a."graphId" = g."id" AND a."userId" = $1))
-          OR (g."isPrepared" = true)
+          OR (g."isPublic" = true AND (g."id" LIKE 'system-%' OR g."userId" = 'system'))
        ORDER BY (g."userId" = $1) DESC, g."updatedAt" DESC`,
       [userId],
     );
@@ -126,6 +155,9 @@ export class GraphsService {
         g."userId", 
         g."isPublic", 
         g."isPrepared", 
+        g."lastAccessedAt",
+        g."scheduledForDeletionAt",
+        g."isExemptFromRetention",
         g."createdAt", 
         g."updatedAt",
         COALESCE(jsonb_array_length(g."nodes"), 0)::int AS "nodeCount",
@@ -246,6 +278,7 @@ export class GraphsService {
         const copiedSourceId = randomUUID();
         const fileUrl = await this.copySourceFile(
           source,
+          copiedGraphId,
           copiedSourceId,
           copiedFiles,
         );
@@ -272,7 +305,12 @@ export class GraphsService {
         copiedGraphId,
       ]);
       await Promise.all(
-        copiedFiles.map((filePath) => rm(filePath, { force: true })),
+        copiedFiles.map(async (fileRef) => {
+          if (this.storage) {
+            await this.storage.deleteObject(fileRef).catch(() => undefined);
+          }
+          await rm(fileRef, { force: true }).catch(() => undefined);
+        }),
       );
       throw error;
     }
@@ -365,11 +403,30 @@ export class GraphsService {
         ? dto.description.trim() || null
         : graph.description;
 
+    let isExemptFromRetention = graph.isExemptFromRetention ?? false;
+    if (
+      dto.isExemptFromRetention !== undefined &&
+      dto.isExemptFromRetention !== isExemptFromRetention
+    ) {
+      if (dto.isExemptFromRetention && viewer.tier !== 'PRO') {
+        throw new ForbiddenException(
+          'Preserving inactive graphs beyond 90 days requires a PRO subscription. Upgrade to Pro to enable lifetime graph retention.',
+        );
+      }
+      isExemptFromRetention = dto.isExemptFromRetention;
+    }
+
     const [updated] = await this.database.query<GraphRecord>(
-      `UPDATE "Graph" SET "title" = $1, "description" = $2, "isPublic" = $3, "updatedAt" = CURRENT_TIMESTAMP
-       WHERE "id" = $4
-       RETURNING "id", "title", "description", "userId", "isPublic", "isPrepared", "nodes", "edges", "createdAt", "updatedAt"`,
-      [title, description, nextIsPublic, graph.id],
+      `UPDATE "Graph"
+       SET "title" = $1,
+           "description" = $2,
+           "isPublic" = $3,
+           "isExemptFromRetention" = $4,
+           "scheduledForDeletionAt" = CASE WHEN $4 = true THEN NULL ELSE "scheduledForDeletionAt" END,
+           "updatedAt" = CURRENT_TIMESTAMP
+       WHERE "id" = $5
+       RETURNING "id", "title", "description", "userId", "isPublic", "isPrepared", "nodes", "edges", "lastAccessedAt", "scheduledForDeletionAt", "isExemptFromRetention", "createdAt", "updatedAt"`,
+      [title, description, nextIsPublic, isExemptFromRetention, graph.id],
     );
     if (!updated) {
       throw new NotFoundException('Graph not found.');
@@ -440,6 +497,10 @@ export class GraphsService {
     graphId: string,
   ): Promise<void> {
     const graph = await this.findEditable(identity, graphId);
+    const sources = await this.database.query<{ fileUrl: string }>(
+      'SELECT "fileUrl" FROM "NodeSource" WHERE "graphId" = $1',
+      [graph.id],
+    );
     await this.database.query(
       'DELETE FROM "GraphAttachment" WHERE "graphId" = $1',
       [graph.id],
@@ -447,6 +508,17 @@ export class GraphsService {
     await this.database.query('DELETE FROM "Graph" WHERE "id" = $1', [
       graph.id,
     ]);
+
+    if (this.storage) {
+      for (const s of sources) {
+        if (!s.fileUrl.startsWith('seed://')) {
+          await this.storage.deleteObject(s.fileUrl).catch(() => undefined);
+        }
+      }
+    }
+    if (this.weaviate) {
+      await this.weaviate.deleteTenant(graph.id).catch(() => undefined);
+    }
   }
 
   async findAccessible(
@@ -454,7 +526,7 @@ export class GraphsService {
     graphId: string,
   ): Promise<GraphRecord> {
     const graph = await this.database.one<GraphRecord>(
-      `SELECT "id", "title", "description", "userId", "isPublic", "isPrepared", "nodes", "edges", "createdAt", "updatedAt"
+      `SELECT "id", "title", "description", "userId", "isPublic", "isPrepared", "nodes", "edges", "lastAccessedAt", "scheduledForDeletionAt", "isExemptFromRetention", "createdAt", "updatedAt"
        FROM "Graph" WHERE "id" = $1`,
       [graphId],
     );
@@ -462,6 +534,7 @@ export class GraphsService {
       throw new NotFoundException('Graph not found.');
     }
     this.authorization.assertCan(identity, 'read', 'Graph', graph);
+    void this.touchAccess(graph.id);
     return graph;
   }
 
@@ -542,6 +615,7 @@ export class GraphsService {
 
   private async copySourceFile(
     source: CopySourceRecord,
+    copiedGraphId: string,
     copiedSourceId: string,
     copiedFiles: string[],
   ): Promise<string> {
@@ -550,11 +624,120 @@ export class GraphsService {
     }
     const extension =
       extname(source.fileUrl) || this.extensionFor(source.fileType);
+
+    if (this.storage) {
+      try {
+        const targetKey = `sources/${copiedGraphId}/${copiedSourceId}/${copiedSourceId}${extension}`;
+        const stored = await this.storage.copyObject(source.fileUrl, targetKey);
+        copiedFiles.push(stored.key);
+        return stored.location;
+      } catch {
+        // Fall back to local file copy below
+      }
+    }
+
     const target = join(this.uploadDirectory, `${copiedSourceId}${extension}`);
     await mkdir(this.uploadDirectory, { recursive: true });
-    await copyFile(source.fileUrl, target);
-    copiedFiles.push(target);
-    return target;
+    if (existsSync(source.fileUrl)) {
+      await copyFile(source.fileUrl, target);
+      copiedFiles.push(target);
+      return target;
+    }
+    return `seed://copy-${copiedSourceId}`;
+  }
+
+  async downloadArchive(
+    identity: ViewerIdentity | undefined,
+    graphId: string,
+    res: Response,
+  ): Promise<StreamableFile> {
+    if (!identity || identity.isGuest) {
+      throw new ForbiddenException('Authentication required');
+    }
+
+    const archive = await this.retentionService?.getArchiveByGraphId(graphId);
+    if (!archive) {
+      throw new NotFoundException(`No archive available for graph ${graphId}`);
+    }
+
+    if (archive.userId !== identity.userId) {
+      throw new ForbiddenException('You do not own this graph archive');
+    }
+
+    if (!this.storage) {
+      throw new NotFoundException('Storage service not available');
+    }
+
+    const file = await this.storage.getObject(archive.archiveUrl);
+    res.set({
+      'Content-Type': 'application/gzip',
+      'Content-Disposition': `attachment; filename="${archive.title.replace(/[^a-zA-Z0-9_-]/g, '_')}_archive.tar.gz"`,
+      'Content-Length': file.contentLength.toString(),
+    });
+
+    return new StreamableFile(file.buffer);
+  }
+
+  async restoreArchive(
+    identity: ViewerIdentity | undefined,
+    id: string,
+  ): Promise<{
+    id: string;
+    title: string;
+    userId: string;
+    sourceCount: number;
+    restored: boolean;
+  }> {
+    const viewer = this.auth.requireRegistered(
+      this.auth.requireIdentity(identity),
+    );
+    if (!this.retentionService) {
+      throw new NotFoundException('Retention service not available');
+    }
+    return this.retentionService.restoreGraphFromArchive(
+      id,
+      viewer.userId,
+      false,
+    );
+  }
+
+  async keepActive(
+    identity: ViewerIdentity | undefined,
+    graphId: string,
+  ): Promise<GraphDetailResponse> {
+    const viewer = this.auth.requireRegistered(
+      this.auth.requireIdentity(identity),
+    );
+    const graph = await this.database.one<GraphRecord>(
+      `SELECT "id", "title", "description", "userId", "isPublic", "isPrepared", "nodes", "edges", "lastAccessedAt", "scheduledForDeletionAt", "isExemptFromRetention", "createdAt", "updatedAt"
+       FROM "Graph" WHERE "id" = $1`,
+      [graphId],
+    );
+    if (!graph) {
+      throw new NotFoundException('Graph not found.');
+    }
+
+    const isOwner = graph.userId === viewer.userId;
+    const isAdmin = (viewer as any).role === 'admin';
+    if (!isOwner && !isAdmin) {
+      this.authorization.assertCan(viewer, 'update', 'Graph', {
+        graphUserId: graph.userId,
+        graphIsPublic: graph.isPublic,
+      });
+    }
+
+    if (this.retentionService) {
+      await this.retentionService.cancelScheduledDeletion(graphId);
+    }
+    await this.database.query(
+      `UPDATE "Graph"
+       SET "scheduledForDeletionAt" = NULL,
+           "lastAccessedAt" = CURRENT_TIMESTAMP
+       WHERE "id" = $1`,
+      [graphId],
+    );
+
+    return this.get(viewer, graphId);
   }
 
   private extensionFor(fileType: string): string {

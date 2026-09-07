@@ -62,4 +62,8 @@ export class UpdateGraphSettingsDto {
   @IsOptional()
   @IsBoolean()
   isPublic?: boolean;
+
+  @IsOptional()
+  @IsBoolean()
+  isExemptFromRetention?: boolean;
 }

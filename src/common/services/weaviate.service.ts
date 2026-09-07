@@ -1,4 +1,5 @@
-import { Injectable } from '@nestjs/common';
+import { createHash } from 'crypto';
+import { Injectable, Logger } from '@nestjs/common';
 import { ConfigService } from '@nestjs/config';
 
 import type { SearchChunk } from '../types.js';
@@ -6,14 +7,55 @@ import { isTabularQuery } from '../../modules/search/search.utils.js';
 
 type VectorizedSearchChunk = SearchChunk & { vector?: number[] };
 
+const NAMESPACE_URL = '6ba7b811-9dad-11d1-80b4-00c04fd430c8';
+
+export function generateChunkUuid(
+  sourceId: string,
+  startChar: number,
+  endChar: number,
+): string {
+  const nsBuffer = Buffer.from(NAMESPACE_URL.replace(/-/g, ''), 'hex');
+  const nameBuffer = Buffer.from(`${sourceId}:${startChar}:${endChar}`, 'utf8');
+  const hash = createHash('sha1')
+    .update(Buffer.concat([nsBuffer, nameBuffer]))
+    .digest();
+  hash[6] = ((hash[6] ?? 0) & 0x0f) | 0x50; // version 5
+  hash[8] = ((hash[8] ?? 0) & 0x3f) | 0x80; // variant RFC 4122
+  const hex = hash.subarray(0, 16).toString('hex');
+  return `${hex.slice(0, 8)}-${hex.slice(8, 12)}-${hex.slice(12, 16)}-${hex.slice(16, 20)}-${hex.slice(20, 32)}`;
+}
+
 @Injectable()
 export class WeaviateService {
   private readonly baseUrl: string;
+  private readonly pqEnabled: boolean;
+  private readonly pqTrainingLimit: number;
+  private readonly pqSegments: number;
+
+  private readonly logger = new Logger(WeaviateService.name);
 
   constructor(config: ConfigService) {
     this.baseUrl = config
       .getOrThrow<string>('WEAVIATE_HTTP_URL')
       .replace(/\/$/, '');
+    this.pqEnabled =
+      config.get<string>('WEAVIATE_PQ_ENABLED', 'false') === 'true';
+    this.pqTrainingLimit = Number.parseInt(
+      config.get<string>('WEAVIATE_PQ_TRAINING_LIMIT', '10000'),
+      10,
+    );
+    this.pqSegments = Number.parseInt(
+      config.get<string>('WEAVIATE_PQ_SEGMENTS', '64'),
+      10,
+    );
+  }
+
+  getPqConfig(): { enabled: boolean; trainingLimit: number; segments: number } {
+    return {
+      enabled: this.pqEnabled,
+      trainingLimit: this.pqTrainingLimit,
+      segments: this.pqSegments,
+    };
   }
 
   async isReady(): Promise<boolean> {
@@ -27,11 +69,16 @@ export class WeaviateService {
 
   async upsertChunk(chunk: SearchChunk, vector?: number[]): Promise<void> {
     await this.ensureSchema();
+    const objectId = generateChunkUuid(
+      chunk.sourceId,
+      chunk.startChar,
+      chunk.endChar,
+    );
     const response = await this.request('/v1/objects', {
       method: 'POST',
       body: JSON.stringify({
         class: 'Chunk',
-        id: `${chunk.sourceId}-${chunk.startChar}-${chunk.endChar}`,
+        id: objectId,
         tenant: chunk.graphId,
         properties: {
           graphId: chunk.graphId,
@@ -46,8 +93,11 @@ export class WeaviateService {
         vector,
       }),
     });
-    if (!response.ok && response.status !== 422) {
-      throw new Error(`Weaviate object write failed: ${response.status}`);
+    if (!response.ok) {
+      const errorText = await response.text().catch(() => '');
+      throw new Error(
+        `Weaviate object write failed (${response.status}): ${errorText}`,
+      );
     }
   }
 
@@ -67,9 +117,14 @@ export class WeaviateService {
 
     const objects = chunks.map((chunk, index) => {
       const vector = vectors?.[index];
+      const objectId = generateChunkUuid(
+        chunk.sourceId,
+        chunk.startChar,
+        chunk.endChar,
+      );
       return {
         class: 'Chunk',
-        id: `${chunk.sourceId}-${chunk.startChar}-${chunk.endChar}`,
+        id: objectId,
         tenant: chunk.graphId,
         properties: {
           graphId: chunk.graphId,
@@ -100,11 +155,32 @@ export class WeaviateService {
         body: JSON.stringify({ objects: slice }),
       });
 
-      if (response.ok || response.status === 200) {
-        indexedCount += slice.length;
-      } else if (response.status !== 422) {
-        throw new Error(`Weaviate batch write failed: ${response.status}`);
+      if (!response.ok) {
+        const errorText = await response.text().catch(() => '');
+        throw new Error(
+          `Weaviate batch write failed with status ${response.status}: ${errorText}`,
+        );
       }
+
+      const body =
+        typeof response.json === 'function'
+          ? ((await response.json().catch(() => null)) as Array<{
+              result?: { errors?: { error?: Array<{ message: string }> } };
+            }> | null)
+          : null;
+
+      if (Array.isArray(body)) {
+        const individualErrors = body.flatMap(
+          (item) => item.result?.errors?.error?.map((e) => e.message) ?? [],
+        );
+        if (individualErrors.length > 0) {
+          this.logger.warn(
+            `Weaviate batch write encountered ${individualErrors.length} item error(s): ${individualErrors.slice(0, 3).join('; ')}`,
+          );
+        }
+      }
+
+      indexedCount += slice.length;
     }
 
     return indexedCount;
@@ -119,6 +195,17 @@ export class WeaviateService {
       });
     } catch {
       // Tenant may already exist
+    }
+  }
+
+  async deleteTenant(graphId: string): Promise<void> {
+    try {
+      await this.request('/v1/schema/Chunk/tenants', {
+        method: 'DELETE',
+        body: JSON.stringify([graphId]),
+      });
+    } catch {
+      // Non-blocking if tenant was already deleted
     }
   }
 
@@ -137,12 +224,13 @@ export class WeaviateService {
     const candidateLimit = isTabularQuery(query)
       ? Math.min(limit * 2, 50)
       : limit;
+    const nodeFilter = this.buildNodeFilter(selectedNodeIds);
     const graphQuery = `{
       Get {
         Chunk(
           tenant: ${JSON.stringify(graphId)}
           hybrid: { query: ${JSON.stringify(query)}, vector: ${JSON.stringify(vector)}, alpha: 0.7 }
-          where: { path: ["graphId"], operator: Equal, valueText: ${JSON.stringify(graphId)} }
+          where: ${nodeFilter}
           limit: ${candidateLimit}
         ) {
           graphId sourceId sourceName nodeId content context startChar endChar pageNum coordinates elementType
@@ -187,12 +275,13 @@ export class WeaviateService {
       return [];
     }
     await this.ensureSchema();
+    const nodeFilter = this.buildNodeFilter(adjacentNodeIds);
     const graphQuery = `{
       Get {
         Chunk(
           tenant: ${JSON.stringify(graphId)}
           nearVector: { vector: ${JSON.stringify(vector)} }
-          where: { path: ["graphId"], operator: Equal, valueText: ${JSON.stringify(graphId)} }
+          where: ${nodeFilter}
           limit: ${limit}
         ) {
           graphId sourceId sourceName nodeId content context startChar endChar pageNum
@@ -273,6 +362,13 @@ export class WeaviateService {
     });
   }
 
+  private buildNodeFilter(nodeIds: string[]): string {
+    if (nodeIds.length === 1) {
+      return `{ path: ["nodeId"], operator: Equal, valueText: ${JSON.stringify(nodeIds[0])} }`;
+    }
+    return `{ path: ["nodeId"], operator: ContainsAny, valueText: ${JSON.stringify(nodeIds)} }`;
+  }
+
   private async ensureSchema(): Promise<void> {
     const schema = await this.request('/v1/schema/Chunk');
     if (schema.ok) {
@@ -296,16 +392,24 @@ export class WeaviateService {
       body: JSON.stringify({
         class: 'Chunk',
         vectorizer: 'none',
+        vectorIndexConfig: {
+          distance: 'cosine',
+          pq: {
+            enabled: this.pqEnabled,
+            trainingLimit: this.pqTrainingLimit,
+            segments: this.pqSegments,
+          },
+        },
         multiTenancyConfig: {
           enabled: true,
           autoTenantCreation: true,
           autoTenantActivation: true,
         },
         properties: [
-          { name: 'sourceId', dataType: ['text'] },
-          { name: 'graphId', dataType: ['text'] },
+          { name: 'sourceId', dataType: ['text'], tokenization: 'field' },
+          { name: 'graphId', dataType: ['text'], tokenization: 'field' },
           { name: 'sourceName', dataType: ['text'] },
-          { name: 'nodeId', dataType: ['text'] },
+          { name: 'nodeId', dataType: ['text'], tokenization: 'field' },
           { name: 'content', dataType: ['text'] },
           { name: 'context', dataType: ['text'] },
           { name: 'startChar', dataType: ['int'] },
@@ -333,7 +437,7 @@ export class WeaviateService {
 
   private async request(path: string, init?: RequestInit): Promise<Response> {
     const controller = new AbortController();
-    const timeout = setTimeout(() => controller.abort(), 3000);
+    const timeout = setTimeout(() => controller.abort(), 10000);
     try {
       return await fetch(`${this.baseUrl}${path}`, {
         ...init,
