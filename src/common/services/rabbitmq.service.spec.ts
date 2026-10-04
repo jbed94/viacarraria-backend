@@ -7,6 +7,10 @@ import {
   PARSING_QUEUE,
   ParsingJob,
   RabbitMqService,
+  TAG_MATCHING_DLQ,
+  TAG_MATCHING_DLX,
+  TAG_MATCHING_QUEUE,
+  TagMatchingJob,
 } from './rabbitmq.service.js';
 
 jest.mock('amqplib');
@@ -80,6 +84,29 @@ describe('RabbitMqService', () => {
         'x-max-priority': 10,
         'x-dead-letter-exchange': PARSING_DLX,
         'x-dead-letter-routing-key': PARSING_DLQ,
+      },
+    });
+
+    // 5. Assert Tag Matching DLX & DLQ
+    expect(mockChannel.assertExchange).toHaveBeenCalledWith(
+      TAG_MATCHING_DLX,
+      'direct',
+      { durable: true },
+    );
+    expect(mockChannel.assertQueue).toHaveBeenCalledWith(TAG_MATCHING_DLQ, {
+      durable: true,
+    });
+    expect(mockChannel.bindQueue).toHaveBeenCalledWith(
+      TAG_MATCHING_DLQ,
+      TAG_MATCHING_DLX,
+      TAG_MATCHING_DLQ,
+    );
+    expect(mockChannel.assertQueue).toHaveBeenCalledWith(TAG_MATCHING_QUEUE, {
+      durable: true,
+      arguments: {
+        'x-max-priority': 10,
+        'x-dead-letter-exchange': TAG_MATCHING_DLX,
+        'x-dead-letter-routing-key': TAG_MATCHING_DLQ,
       },
     });
   });
@@ -173,6 +200,42 @@ describe('RabbitMqService', () => {
     await service.onModuleInit();
 
     expect(mockChannel.deleteQueue).toHaveBeenCalledWith(PARSING_QUEUE);
-    expect(mockChannel.assertQueue).toHaveBeenCalledTimes(3); // 1. DLQ, 2. failed main, 3. recreated main
+    expect(mockChannel.assertQueue).toHaveBeenCalledTimes(5); // 1. DLQ, 2. failed main, 3. recreated main, 4. Tag DLQ, 5. Tag Queue
+  });
+
+  it('publishes tag matching job with default priority and retries metadata', async () => {
+    const job: TagMatchingJob = {
+      jobId: 'tag-job-123',
+      sourceId: 'src-123',
+      graphId: 'graph-123',
+      sourceName: 'Architecture Overview',
+      sourceContent: 'System architecture with distributed message queues',
+      vocabItems: [
+        { term: 'queue', weight: 1.0 },
+        { term: 'distributed', weight: 0.8 },
+      ],
+      priority: 7,
+    };
+
+    await service.publishTagMatchingJob(job);
+
+    expect(mockChannel.sendToQueue).toHaveBeenCalledWith(
+      TAG_MATCHING_QUEUE,
+      expect.any(Buffer),
+      {
+        contentType: 'application/json',
+        persistent: true,
+        priority: 7,
+      },
+    );
+
+    const sentPayload = JSON.parse(
+      mockChannel.sendToQueue.mock.calls[0][1].toString(),
+    );
+    expect(sentPayload.jobId).toBe('tag-job-123');
+    expect(sentPayload.sourceId).toBe('src-123');
+    expect(sentPayload.retryCount).toBe(0);
+    expect(sentPayload.maxRetries).toBe(3);
+    expect(sentPayload.priority).toBe(7);
   });
 });

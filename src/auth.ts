@@ -59,11 +59,11 @@ export const auth = betterAuth({
         type: 'string',
         required: false,
         input: false,
-        defaultValue: 'FREE',
+        defaultValue: 'REGISTERED',
         returned: true,
       },
-      subscriptionExpiresAt: {
-        type: 'date',
+      storageLimitMb: {
+        type: 'number',
         required: false,
         input: false,
         returned: true,
@@ -74,12 +74,6 @@ export const auth = betterAuth({
         input: false,
         defaultValue: 'en',
         returned: true,
-      },
-      lemonSqueezyCustomerId: {
-        type: 'string',
-        required: false,
-        input: false,
-        returned: false,
       },
     },
   },

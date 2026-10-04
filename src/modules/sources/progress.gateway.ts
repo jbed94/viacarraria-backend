@@ -21,6 +21,7 @@ import { auth } from '../../auth.js';
 import { DatabaseService } from '../../common/services/database.service.js';
 import { RedisService } from '../../common/services/redis.service.js';
 import type { ViewerIdentity } from '../../common/types.js';
+import type { CrawlProgressPayload } from '../search/search.dto.js';
 
 export type ProgressPayload = {
   sourceId: string;
@@ -29,6 +30,8 @@ export type ProgressPayload = {
   status: string;
   progress: number;
 };
+
+export type { CrawlProgressPayload };
 
 @WebSocketGateway({
   namespace: 'ws',
@@ -172,8 +175,21 @@ export class ProgressGateway
     try {
       this.subscriber = this.redisService.createSubscriber();
       if (this.subscriber) {
-        await this.subscriber.connect().catch(() => {});
-        await this.subscriber.subscribe('source:progress', 'notification:new');
+        this.subscriber.on('error', (err: Error) => {
+          this.logger.warn(`Source progress subscriber error: ${err.message}`);
+        });
+        await this.subscriber.connect().catch((err: unknown) => {
+          this.logger.warn(
+            `Failed to connect progress subscriber: ${String(err)}`,
+          );
+        });
+        await this.subscriber
+          .subscribe('source:progress', 'notification:new', 'crawl:progress')
+          .catch((err: unknown) => {
+            this.logger.warn(
+              `Failed to subscribe to progress channels: ${String(err)}`,
+            );
+          });
         this.subscriber.on('message', (channel: string, message: string) => {
           if (channel === 'source:progress') {
             try {
@@ -196,10 +212,19 @@ export class ProgressGateway
             } catch (err) {
               this.logger.warn(`Failed to parse notification message: ${err}`);
             }
+          } else if (channel === 'crawl:progress') {
+            try {
+              const data = JSON.parse(message) as CrawlProgressPayload;
+              this.emitCrawlProgress(data);
+            } catch (err) {
+              this.logger.warn(
+                `Failed to parse crawl:progress message: ${err}`,
+              );
+            }
           }
         });
         this.logger.log(
-          'ProgressGateway subscribed to Redis source:progress and notification:new channels',
+          'ProgressGateway subscribed to Redis source:progress, notification:new, and crawl:progress channels',
         );
       }
     } catch (err) {
@@ -215,6 +240,7 @@ export class ProgressGateway
         await this.subscriber.unsubscribe(
           'source:progress',
           'notification:new',
+          'crawl:progress',
         );
         await this.subscriber.quit();
       } catch {
@@ -230,6 +256,16 @@ export class ProgressGateway
         .emit('progress:update', payload);
     } else {
       this.server?.emit('progress:update', payload);
+    }
+  }
+
+  emitCrawlProgress(payload: CrawlProgressPayload): void {
+    if (payload.graphId && this.server) {
+      this.server
+        .to(`graph:${payload.graphId}`)
+        .emit('crawl:progress', payload);
+    } else {
+      this.server?.emit('crawl:progress', payload);
     }
   }
 }

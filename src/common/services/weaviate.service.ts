@@ -1,11 +1,20 @@
 import { createHash } from 'crypto';
-import { Injectable, Logger } from '@nestjs/common';
+import { Injectable, Logger, Optional } from '@nestjs/common';
 import { ConfigService } from '@nestjs/config';
 
-import type { SearchChunk } from '../types.js';
+import type { SearchChunk, SubscriptionTier } from '../types.js';
 import { isTabularQuery } from '../../modules/search/search.utils.js';
+import { SimilarityQueueService } from './similarity-queue.service.js';
 
-type VectorizedSearchChunk = SearchChunk & { vector?: number[] };
+export type VectorizedSearchChunk = SearchChunk & { vector?: number[] };
+
+export type VectorSearchQuery = {
+  id: string;
+  vector: number[];
+  adjacentNodeIds: string[];
+  limit: number;
+  minScore?: number;
+};
 
 const NAMESPACE_URL = '6ba7b811-9dad-11d1-80b4-00c04fd430c8';
 
@@ -34,7 +43,10 @@ export class WeaviateService {
 
   private readonly logger = new Logger(WeaviateService.name);
 
-  constructor(config: ConfigService) {
+  constructor(
+    config: ConfigService,
+    @Optional() private readonly similarityQueue?: SimilarityQueueService,
+  ) {
     this.baseUrl = config
       .getOrThrow<string>('WEAVIATE_HTTP_URL')
       .replace(/\/$/, '');
@@ -89,6 +101,10 @@ export class WeaviateService {
           context: chunk.context,
           startChar: chunk.startChar,
           endChar: chunk.endChar,
+          ...(chunk.imageAssetUrl
+            ? { imageAssetUrl: chunk.imageAssetUrl }
+            : {}),
+          ...(chunk.lqip ? { lqip: chunk.lqip } : {}),
         },
         vector,
       }),
@@ -140,6 +156,10 @@ export class WeaviateService {
             ? { coordinates: chunk.coordinates }
             : {}),
           ...(chunk.elementType ? { elementType: chunk.elementType } : {}),
+          ...(chunk.imageAssetUrl
+            ? { imageAssetUrl: chunk.imageAssetUrl }
+            : {}),
+          ...(chunk.lqip ? { lqip: chunk.lqip } : {}),
         },
         ...(vector?.length ? { vector } : {}),
       };
@@ -216,6 +236,37 @@ export class WeaviateService {
     vector: number[],
     limit = 25,
     minScore?: number,
+    tier?: SubscriptionTier,
+  ): Promise<VectorizedSearchChunk[]> {
+    if (this.similarityQueue) {
+      return this.similarityQueue.enqueue(tier, () =>
+        this.executeHybridSearch(
+          graphId,
+          query,
+          selectedNodeIds,
+          vector,
+          limit,
+          minScore,
+        ),
+      );
+    }
+    return this.executeHybridSearch(
+      graphId,
+      query,
+      selectedNodeIds,
+      vector,
+      limit,
+      minScore,
+    );
+  }
+
+  private async executeHybridSearch(
+    graphId: string,
+    query: string,
+    selectedNodeIds: string[],
+    vector: number[],
+    limit = 25,
+    minScore?: number,
   ): Promise<VectorizedSearchChunk[]> {
     if (selectedNodeIds.length === 0) {
       return [];
@@ -233,7 +284,7 @@ export class WeaviateService {
           where: ${nodeFilter}
           limit: ${candidateLimit}
         ) {
-          graphId sourceId sourceName nodeId content context startChar endChar pageNum coordinates elementType
+          graphId sourceId sourceName nodeId content context startChar endChar pageNum coordinates elementType imageAssetUrl lqip
           _additional { score vector }
         }
       }
@@ -270,7 +321,35 @@ export class WeaviateService {
     adjacentNodeIds: string[],
     limit: number,
     minScore?: number,
-  ): Promise<SearchChunk[]> {
+    tier?: SubscriptionTier,
+  ): Promise<VectorizedSearchChunk[]> {
+    if (this.similarityQueue) {
+      return this.similarityQueue.enqueue(tier, () =>
+        this.executeVectorSearch(
+          graphId,
+          vector,
+          adjacentNodeIds,
+          limit,
+          minScore,
+        ),
+      );
+    }
+    return this.executeVectorSearch(
+      graphId,
+      vector,
+      adjacentNodeIds,
+      limit,
+      minScore,
+    );
+  }
+
+  private async executeVectorSearch(
+    graphId: string,
+    vector: number[],
+    adjacentNodeIds: string[],
+    limit: number,
+    minScore?: number,
+  ): Promise<VectorizedSearchChunk[]> {
     if (adjacentNodeIds.length === 0 || limit < 1) {
       return [];
     }
@@ -284,8 +363,8 @@ export class WeaviateService {
           where: ${nodeFilter}
           limit: ${limit}
         ) {
-          graphId sourceId sourceName nodeId content context startChar endChar pageNum
-          _additional { score }
+          graphId sourceId sourceName nodeId content context startChar endChar pageNum coordinates elementType imageAssetUrl lqip
+          _additional { score vector }
         }
       }
     }`;
@@ -305,13 +384,109 @@ export class WeaviateService {
     ) {
       return [];
     }
-    const chunks = this.toSearchChunks(body.data?.Get?.Chunk ?? [], graphId)
-      .filter((chunk) => adjacentNodeIds.includes(chunk.nodeId))
-      .map(withoutVector);
+    const chunks = this.toSearchChunks(
+      body.data?.Get?.Chunk ?? [],
+      graphId,
+    ).filter((chunk) => adjacentNodeIds.includes(chunk.nodeId));
     if (minScore !== undefined) {
       return chunks.filter((chunk) => chunk.score >= minScore);
     }
     return chunks;
+  }
+
+  async multiVectorSearch(
+    graphId: string,
+    queries: VectorSearchQuery[],
+    tier?: SubscriptionTier,
+  ): Promise<Map<string, VectorizedSearchChunk[]>> {
+    if (this.similarityQueue) {
+      return this.similarityQueue.enqueue(tier, () =>
+        this.executeMultiVectorSearch(graphId, queries),
+      );
+    }
+    return this.executeMultiVectorSearch(graphId, queries);
+  }
+
+  private async executeMultiVectorSearch(
+    graphId: string,
+    queries: VectorSearchQuery[],
+  ): Promise<Map<string, VectorizedSearchChunk[]>> {
+    const resultMap = new Map<string, VectorizedSearchChunk[]>();
+    for (const q of queries) {
+      resultMap.set(q.id, []);
+    }
+
+    const validQueries = queries.filter(
+      (q) =>
+        q.adjacentNodeIds.length > 0 &&
+        q.limit > 0 &&
+        Array.isArray(q.vector) &&
+        q.vector.length > 0,
+    );
+    if (validQueries.length === 0) {
+      return resultMap;
+    }
+
+    await this.ensureSchema();
+
+    const aliasMap = new Map<string, VectorSearchQuery>();
+    const queryBlocks: string[] = [];
+
+    validQueries.forEach((q, index) => {
+      const alias = `b_${index}`;
+      aliasMap.set(alias, q);
+      const nodeFilter = this.buildNodeFilter(q.adjacentNodeIds);
+      queryBlocks.push(`
+        ${alias}: Chunk(
+          tenant: ${JSON.stringify(graphId)}
+          nearVector: { vector: ${JSON.stringify(q.vector)} }
+          where: ${nodeFilter}
+          limit: ${q.limit}
+        ) {
+          graphId sourceId sourceName nodeId content context startChar endChar pageNum coordinates elementType imageAssetUrl lqip
+          _additional { score vector }
+        }
+      `);
+    });
+
+    const graphQuery = `{
+      Get {
+        ${queryBlocks.join('\n')}
+      }
+    }`;
+
+    const response = await this.request('/v1/graphql', {
+      method: 'POST',
+      body: JSON.stringify({ query: graphQuery }),
+    });
+
+    if (!response.ok) {
+      throw new Error(`Weaviate multi-search failed: ${response.status}`);
+    }
+
+    const body = (await response.json()) as {
+      data?: { Get?: Record<string, Array<Record<string, unknown>>> };
+      errors?: Array<{ message: string }>;
+    };
+
+    if (
+      body.errors?.some((error) => error.message.includes('tenant not found'))
+    ) {
+      return resultMap;
+    }
+
+    for (const [alias, q] of aliasMap.entries()) {
+      const rawChunks = body.data?.Get?.[alias] ?? [];
+      let chunks = this.toSearchChunks(rawChunks, graphId).filter((chunk) =>
+        q.adjacentNodeIds.includes(chunk.nodeId),
+      );
+      if (q.minScore !== undefined) {
+        chunks = chunks.filter((chunk) => chunk.score >= q.minScore!);
+      }
+      resultMap.set(q.id, chunks);
+    }
+
+    return resultMap;
   }
 
   private toSearchChunks(
@@ -355,6 +530,11 @@ export class WeaviateService {
             : undefined,
           elementType:
             typeof item.elementType === 'string' ? item.elementType : undefined,
+          imageAssetUrl:
+            typeof item.imageAssetUrl === 'string'
+              ? item.imageAssetUrl
+              : undefined,
+          lqip: typeof item.lqip === 'string' ? item.lqip : undefined,
           score: Number.parseFloat(additional?.score ?? '0'),
           ...(vector?.length ? { vector } : {}),
         },
@@ -384,6 +564,12 @@ export class WeaviateService {
       }
       if (!existing.has('elementType')) {
         await this.addProperty('elementType', ['text']);
+      }
+      if (!existing.has('imageAssetUrl')) {
+        await this.addProperty('imageAssetUrl', ['text']);
+      }
+      if (!existing.has('lqip')) {
+        await this.addProperty('lqip', ['text']);
       }
       return;
     }
@@ -417,6 +603,8 @@ export class WeaviateService {
           { name: 'pageNum', dataType: ['int'] },
           { name: 'coordinates', dataType: ['number[]'] },
           { name: 'elementType', dataType: ['text'] },
+          { name: 'imageAssetUrl', dataType: ['text'] },
+          { name: 'lqip', dataType: ['text'] },
         ],
       }),
     });

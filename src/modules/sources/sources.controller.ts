@@ -1,4 +1,5 @@
 import {
+  BadRequestException,
   Body,
   Controller,
   Delete,
@@ -16,13 +17,17 @@ import {
   UseInterceptors,
 } from '@nestjs/common';
 import { FileInterceptor } from '@nestjs/platform-express';
+import { randomUUID } from 'crypto';
 import type { Response } from 'express';
 
 import type { AuthenticatedRequest } from '../../common/types.js';
 import {
   AbortUploadDto,
   CompleteUploadDto,
+  CreateNoteDto,
   PresignedUploadDto,
+  SetSourceAdTagsDto,
+  UpdateSourceDto,
   UpdateSourceStatusDto,
   type UploadedDocument,
   UploadSourceDto,
@@ -90,6 +95,23 @@ export class SourcesController {
       uploadId,
       partNumber,
     );
+  }
+
+  @Post('note')
+  async createNote(
+    @Req() request: AuthenticatedRequest,
+    @Body() dto: CreateNoteDto,
+  ) {
+    return this.sourcesService.createNote(request.identity, dto);
+  }
+
+  @Put(':id')
+  async update(
+    @Req() request: AuthenticatedRequest,
+    @Param('id') id: string,
+    @Body() dto: UpdateSourceDto,
+  ) {
+    return this.sourcesService.update(request.identity, id, dto);
   }
 
   @Get(':id')
@@ -160,5 +182,89 @@ export class SourcesController {
     @Body() dto: UpdateSourceStatusDto,
   ) {
     return this.sourcesService.updateFromWorker(token, id, dto);
+  }
+
+  @Put(':id/ad-tags')
+  async setSourceAdTagsFromWorker(
+    @Headers('x-internal-token') token: string | undefined,
+    @Param('id') id: string,
+    @Body() dto: SetSourceAdTagsDto,
+  ) {
+    return this.sourcesService.setAdTagsFromWorker(token, id, dto);
+  }
+
+  @Post(':id/assets')
+  @UseInterceptors(
+    FileInterceptor('file', { limits: { fileSize: 15 * 1024 * 1024 } }),
+  )
+  async uploadAsset(
+    @Headers('x-internal-token') token: string | undefined,
+    @Headers('content-type') rawContentType: string | undefined,
+    @Param('id') sourceId: string,
+    @UploadedFile() file: UploadedDocument | undefined,
+    @Query('name') queryName?: string,
+    @Body() body?: any,
+    @Req() req?: any,
+  ) {
+    let buffer: Buffer | undefined;
+    let contentType = 'image/png';
+    let assetName =
+      queryName || (body && typeof body === 'object' ? body.name : undefined);
+
+    if (file && file.buffer) {
+      buffer = file.buffer;
+      contentType = file.mimetype || 'image/png';
+      assetName = assetName || file.originalname;
+    } else if (Buffer.isBuffer(body)) {
+      buffer = body;
+      contentType = rawContentType || 'image/png';
+    } else if (req && Buffer.isBuffer(req.body)) {
+      buffer = req.body;
+      contentType = rawContentType || 'image/png';
+    } else if (body && body.data && typeof body.data === 'string') {
+      buffer = Buffer.from(body.data, 'base64');
+      contentType = body.contentType || 'image/png';
+      assetName = assetName || body.name;
+    }
+
+    if (!buffer || buffer.length === 0) {
+      throw new BadRequestException(
+        'Asset file or payload buffer is required.',
+      );
+    }
+
+    assetName =
+      assetName ||
+      `${randomUUID()}.${contentType.includes('jpeg') || contentType.includes('jpg') ? 'jpg' : 'png'}`;
+
+    return this.sourcesService.uploadAsset(
+      token,
+      sourceId,
+      assetName,
+      buffer,
+      contentType,
+    );
+  }
+
+  @Get(':id/assets/:assetId')
+  async getAsset(
+    @Param('id') sourceId: string,
+    @Param('assetId') assetId: string,
+    @Headers('x-internal-token') token: string | undefined,
+    @Req() request: AuthenticatedRequest,
+    @Res() res: Response,
+  ) {
+    const asset = await this.sourcesService.getAsset(
+      sourceId,
+      assetId,
+      token,
+      request.identity,
+    );
+    res.status(asset.status || 200);
+    res.setHeader('Content-Type', asset.contentType || 'image/png');
+    res.setHeader('Content-Length', asset.contentLength);
+    res.setHeader('Cache-Control', 'public, max-age=31536000, immutable');
+    res.setHeader('Cross-Origin-Resource-Policy', 'cross-origin');
+    res.send(asset.buffer);
   }
 }

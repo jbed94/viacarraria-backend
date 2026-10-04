@@ -20,6 +20,8 @@ import type { Response } from 'express';
 import { AdminGuard } from '../../common/guards/admin.guard.js';
 import { StorageService } from '../../common/services/storage.service.js';
 import { GraphRetentionService } from '../graphs/graph-retention.service.js';
+import { AdContextService } from '../plans/ad-context.service.js';
+import { PlansService } from '../plans/plans.service.js';
 import { AdminController } from './admin.controller.js';
 import { AdminService } from './admin.service.js';
 
@@ -39,13 +41,10 @@ describe('AdminController', () => {
     updateGraphContent: jest.Mock;
     deleteGraph: jest.Mock;
     deleteArchive: jest.Mock;
-    getSubscriptionEvents: jest.Mock;
-    grantSubscription: jest.Mock;
-    revokeSubscription: jest.Mock;
     exportUsers: jest.Mock;
-    exportSubscriptionEvents: jest.Mock;
     batchUsers: jest.Mock;
     batchGraphs: jest.Mock;
+    updateUserStorageLimit: jest.Mock;
     getSystemSettings: jest.Mock;
     updateSystemSettings: jest.Mock;
     getAuditLogs: jest.Mock;
@@ -53,6 +52,7 @@ describe('AdminController', () => {
     getAuditArchives: jest.Mock;
     downloadAuditArchive: jest.Mock;
     getAuditArchiveContent: jest.Mock;
+    recordAuditEvent?: jest.Mock;
   };
   let retentionService: {
     runRetentionSweep: jest.Mock;
@@ -64,6 +64,23 @@ describe('AdminController', () => {
   let storageService: {
     getObject: jest.Mock;
     getStorageProxyStatus: jest.Mock;
+  };
+  let plansService: {
+    getPlanDefinitions: jest.Mock;
+    getPlanDefinition: jest.Mock;
+    updatePlanDefinition: jest.Mock;
+    getAdAnalytics: jest.Mock;
+    exportAdTelemetryCsv: jest.Mock;
+    rollupAdTelemetryDaily: jest.Mock;
+    purgeOldAdTelemetryEvents: jest.Mock;
+    getAdTelemetryStatus: jest.Mock;
+  };
+  let adContextService: {
+    getAllTags: jest.Mock;
+    getTagStats: jest.Mock;
+    createTag: jest.Mock;
+    updateTag: jest.Mock;
+    deleteTag: jest.Mock;
   };
 
   beforeEach(async () => {
@@ -85,24 +102,19 @@ describe('AdminController', () => {
       getOverviewStats: jest.fn().mockResolvedValue({
         users: {
           total: 100,
-          pro: 20,
-          free: 70,
+          registered: 90,
           anonymous: 10,
           newLast30Days: 15,
         },
-        revenue: {
-          monthlyRecurringRevenue: 200,
-          totalRevenue: 540,
-          proPriceUsd: 10,
-          activeSubscriptions: 20,
-          monthlyDistribution: [
-            {
-              month: '2026-09',
-              label: 'Sep 2026',
-              revenue: 200,
-              eventsCount: 20,
-            },
-          ],
+        similarityQueue: {
+          occupation: 'low',
+          anonymousThroughputPerMinute: 30,
+          registeredThroughputPerMinute: 120,
+        },
+        storageQuota: {
+          defaultStorageLimitMb: 100,
+          totalStorageBytes: 104857600,
+          totalSources: 80,
         },
         requests: {
           totalQueries: 500,
@@ -129,7 +141,7 @@ describe('AdminController', () => {
       }),
       getUsers: jest.fn().mockResolvedValue({
         users: [
-          { id: 'u-1', email: 'user@test.com', subscriptionTier: 'FREE' },
+          { id: 'u-1', email: 'user@test.com', subscriptionTier: 'REGISTERED' },
         ],
         pagination: { total: 1, page: 1, limit: 20, totalPages: 1 },
       }),
@@ -141,7 +153,7 @@ describe('AdminController', () => {
         storage: { sourcesCount: 0, totalBytes: 0 },
       }),
       updateUser: jest.fn().mockResolvedValue({
-        user: { id: 'u-1', subscriptionTier: 'PRO' },
+        user: { id: 'u-1', subscriptionTier: 'REGISTERED' },
       }),
       deleteUser: jest.fn().mockResolvedValue({ deleted: true, userId: 'u-1' }),
       getGraphs: jest.fn().mockResolvedValue({
@@ -170,20 +182,11 @@ describe('AdminController', () => {
       deleteArchive: jest
         .fn()
         .mockResolvedValue({ deleted: true, graphId: 'g-1' }),
-      getSubscriptionEvents: jest.fn().mockResolvedValue({
-        events: [{ id: 'ev-1', eventType: 'order_created' }],
-        pagination: { total: 1, page: 1, limit: 20, totalPages: 1 },
-      }),
-      grantSubscription: jest.fn().mockResolvedValue({
-        user: { id: 'u-1', subscriptionTier: 'PRO' },
-      }),
-      revokeSubscription: jest.fn().mockResolvedValue({
-        user: { id: 'u-1', subscriptionTier: 'FREE' },
+      updateUserStorageLimit: jest.fn().mockResolvedValue({
+        id: 'u-1',
+        storageLimitMb: 250,
       }),
       exportUsers: jest.fn().mockResolvedValue('User ID,Name\nu-1,Test User'),
-      exportSubscriptionEvents: jest
-        .fn()
-        .mockResolvedValue('Event ID,User ID\nev-1,u-1'),
       batchUsers: jest.fn().mockResolvedValue({
         success: true,
         action: 'set_tier',
@@ -212,6 +215,11 @@ describe('AdminController', () => {
           authenticatedPerMinute: 120,
           burstMultiplier: 2,
         },
+        adConfig: {
+          effectiveEcpm: 1.5,
+          canvasAdDensity: 35,
+          maxCanvasAds: 5,
+        },
         maintenanceMode: false,
         updatedAt: '2026-09-01T00:00:00.000Z',
       }),
@@ -235,6 +243,11 @@ describe('AdminController', () => {
           authenticatedPerMinute:
             patch.rateLimits?.authenticatedPerMinute ?? 120,
           burstMultiplier: patch.rateLimits?.burstMultiplier ?? 2,
+        },
+        adConfig: {
+          effectiveEcpm: patch.adConfig?.effectiveEcpm ?? 1.5,
+          canvasAdDensity: patch.adConfig?.canvasAdDensity ?? 35,
+          maxCanvasAds: patch.adConfig?.maxCanvasAds ?? 5,
         },
         maintenanceMode: patch.maintenanceMode ?? false,
         updatedAt: '2026-09-06T22:00:00.000Z',
@@ -352,12 +365,93 @@ describe('AdminController', () => {
       }),
     };
 
+    plansService = {
+      getPlanDefinitions: jest.fn().mockResolvedValue([
+        { tier: 'ANONYMOUS', version: 1 },
+        { tier: 'REGISTERED', version: 1 },
+      ]),
+      getPlanDefinition: jest
+        .fn()
+        .mockResolvedValue({ tier: 'REGISTERED', version: 1 }),
+      updatePlanDefinition: jest.fn().mockResolvedValue({
+        tier: 'REGISTERED',
+        version: 2,
+        name: 'Registered Updated',
+      }),
+      getAdAnalytics: jest.fn().mockResolvedValue({
+        totalImpressions: 120,
+        totalCulled: 40,
+        totalRefreshes: 10,
+        averageViewabilitySeconds: 15.5,
+        totalActiveViewableSeconds: 1860,
+        estimatedRevenueUsd: 0.18,
+        effectiveEcpm: 1.5,
+        gpuSavingsPercentage: 25.0,
+        consentBreakdown: { personalized: 90, contextual: 20, declined: 10 },
+      }),
+      exportAdTelemetryCsv: jest
+        .fn()
+        .mockResolvedValue('id,eventType\n1,impression'),
+      rollupAdTelemetryDaily: jest
+        .fn()
+        .mockResolvedValue({ success: true, rowsRolledUp: 42 }),
+      purgeOldAdTelemetryEvents: jest.fn().mockResolvedValue({
+        success: true,
+        purgedCount: 15,
+        retentionDays: 90,
+      }),
+      getAdTelemetryStatus: jest.fn().mockResolvedValue({
+        totalEventsCount: 100,
+        totalRollupsCount: 10,
+        oldestEventDate: '2026-06-01T00:00:00.000Z',
+        newestEventDate: '2026-09-16T12:00:00.000Z',
+        lastRollupDate: '2026-09-15',
+        retentionDays: 90,
+        autoRollupEnabled: true,
+        scheduleIntervalHours: 24,
+      }),
+    };
+
+    adContextService = {
+      getAllTags: jest.fn().mockResolvedValue([
+        {
+          id: 'tag-1',
+          name: 'Artificial Intelligence',
+          slug: 'artificial-intelligence',
+          enabled: true,
+          matchCount: 5,
+          sendCount: 12,
+        },
+      ]),
+      getTagStats: jest.fn().mockResolvedValue({
+        totalTags: 1,
+        enabledTags: 1,
+        totalMatches: 5,
+        totalSends: 12,
+        topMatchedTags: [],
+        topSentTags: [],
+      }),
+      createTag: jest.fn().mockResolvedValue({
+        id: 'tag-2',
+        name: 'Cybersecurity',
+        slug: 'cybersecurity',
+      }),
+      updateTag: jest.fn().mockResolvedValue({
+        id: 'tag-1',
+        name: 'AI Updated',
+        slug: 'artificial-intelligence',
+      }),
+      deleteTag: jest.fn().mockResolvedValue({ success: true }),
+    };
+
     const module: TestingModule = await Test.createTestingModule({
       controllers: [AdminController],
       providers: [
         { provide: AdminService, useValue: adminService },
         { provide: GraphRetentionService, useValue: retentionService },
         { provide: StorageService, useValue: storageService },
+        { provide: PlansService, useValue: plansService },
+        { provide: AdContextService, useValue: adContextService },
       ],
     })
       .overrideGuard(AdminGuard)
@@ -400,23 +494,31 @@ describe('AdminController', () => {
     it('returns comprehensive business and system KPIs', async () => {
       const res = await controller.getOverviewStats();
       expect(res.users.total).toBe(100);
-      expect(res.users.pro).toBe(20);
-      expect(res.revenue.monthlyRecurringRevenue).toBe(200);
-      expect(res.revenue.totalRevenue).toBe(540);
-      expect(res.revenue.monthlyDistribution).toHaveLength(1);
+      expect(res.users.registered).toBe(90);
+      expect(res.similarityQueue.occupation).toBe('low');
+      expect(res.storageQuota.defaultStorageLimitMb).toBe(100);
       expect(adminService.getOverviewStats).toHaveBeenCalled();
     });
   });
 
   describe('user management', () => {
-    it('returns paginated users list', async () => {
-      const res = await controller.getUsers('1', '20', 'test', 'PRO');
+    it('returns paginated users list with filters', async () => {
+      const res = await controller.getUsers(
+        '1',
+        '20',
+        'test',
+        'REGISTERED',
+        'HIGH_USAGE',
+        'ACTIVE',
+      );
       expect(res.users).toHaveLength(1);
       expect(adminService.getUsers).toHaveBeenCalledWith({
         page: 1,
         limit: 20,
         search: 'test',
-        tier: 'PRO',
+        tier: 'REGISTERED',
+        storageFilter: 'HIGH_USAGE',
+        activityFilter: 'ACTIVE',
       });
     });
 
@@ -428,11 +530,11 @@ describe('AdminController', () => {
 
     it('updates user subscription and details', async () => {
       const res = await controller.updateUser('u-1', {
-        subscriptionTier: 'PRO',
+        subscriptionTier: 'REGISTERED',
       });
-      expect(res.user.subscriptionTier).toBe('PRO');
+      expect(res.user.subscriptionTier).toBe('REGISTERED');
       expect(adminService.updateUser).toHaveBeenCalledWith('u-1', {
-        subscriptionTier: 'PRO',
+        subscriptionTier: 'REGISTERED',
       });
     });
 
@@ -447,11 +549,20 @@ describe('AdminController', () => {
         setHeader: jest.fn(),
         send: jest.fn(),
       } as unknown as Response;
-      await controller.exportUsers(res, 'csv', 'alice', 'PRO');
+      await controller.exportUsers(
+        res,
+        'csv',
+        'alice',
+        'REGISTERED',
+        'HIGH_USAGE',
+        'ACTIVE',
+      );
       expect(adminService.exportUsers).toHaveBeenCalledWith({
         format: 'csv',
         search: 'alice',
-        tier: 'PRO',
+        tier: 'REGISTERED',
+        storageFilter: 'HIGH_USAGE',
+        activityFilter: 'ACTIVE',
       });
       expect(res.setHeader).toHaveBeenCalledWith(
         'Content-Type',
@@ -466,11 +577,20 @@ describe('AdminController', () => {
         setHeader: jest.fn(),
         json: jest.fn(),
       } as unknown as Response;
-      await controller.exportUsers(res, 'json', undefined, undefined);
+      await controller.exportUsers(
+        res,
+        'json',
+        undefined,
+        undefined,
+        undefined,
+        undefined,
+      );
       expect(adminService.exportUsers).toHaveBeenCalledWith({
         format: 'json',
         search: undefined,
         tier: undefined,
+        storageFilter: undefined,
+        activityFilter: undefined,
       });
       expect(res.setHeader).toHaveBeenCalledWith(
         'Content-Type',
@@ -483,13 +603,13 @@ describe('AdminController', () => {
       const res = await controller.batchUsers({
         userIds: ['u-1', 'u-2'],
         action: 'set_tier',
-        tier: 'PRO',
+        tier: 'REGISTERED',
       });
       expect(res.success).toBe(true);
       expect(adminService.batchUsers).toHaveBeenCalledWith({
         userIds: ['u-1', 'u-2'],
         action: 'set_tier',
-        tier: 'PRO',
+        tier: 'REGISTERED',
       });
     });
   });
@@ -635,69 +755,16 @@ describe('AdminController', () => {
     });
   });
 
-  describe('subscriptions & billing', () => {
-    it('returns subscription events audit log', async () => {
-      const res = await controller.getSubscriptionEvents('1', '20');
-      expect(res.events).toHaveLength(1);
-      expect(adminService.getSubscriptionEvents).toHaveBeenCalledWith({
-        page: 1,
-        limit: 20,
-      });
-    });
-
-    it('grants PRO subscription manually', async () => {
-      const res = await controller.grantSubscription({
-        userId: 'u-1',
-        tier: 'PRO',
-        durationDays: 30,
-      });
-      expect(res.user.subscriptionTier).toBe('PRO');
-      expect(adminService.grantSubscription).toHaveBeenCalledWith(
+  describe('user storage limits', () => {
+    it('updates user storage limit and records audit event', async () => {
+      const req = { identity: { userId: 'admin-1', role: 'admin' } } as any;
+      const res = await controller.updateUserStorageLimit('u-1', 250, req);
+      expect(res.storageLimitMb).toBe(250);
+      expect(adminService.updateUserStorageLimit).toHaveBeenCalledWith(
         'u-1',
-        'PRO',
-        30,
+        250,
+        { userId: 'admin-1', role: 'admin' },
       );
-    });
-
-    it('revokes PRO subscription manually', async () => {
-      const res = await controller.revokeSubscription({ userId: 'u-1' });
-      expect(res.user.subscriptionTier).toBe('FREE');
-      expect(adminService.revokeSubscription).toHaveBeenCalledWith('u-1');
-    });
-
-    it('exports subscription events in CSV format', async () => {
-      const res = {
-        setHeader: jest.fn(),
-        send: jest.fn(),
-      } as unknown as Response;
-      await controller.exportSubscriptionEvents(res, 'csv');
-      expect(adminService.exportSubscriptionEvents).toHaveBeenCalledWith({
-        format: 'csv',
-      });
-      expect(res.setHeader).toHaveBeenCalledWith(
-        'Content-Type',
-        'text/csv; charset=utf-8',
-      );
-      expect(res.send).toHaveBeenCalledWith('Event ID,User ID\nev-1,u-1');
-    });
-
-    it('exports subscription events in JSON format', async () => {
-      adminService.exportSubscriptionEvents.mockResolvedValueOnce([
-        { id: 'ev-1' },
-      ]);
-      const res = {
-        setHeader: jest.fn(),
-        json: jest.fn(),
-      } as unknown as Response;
-      await controller.exportSubscriptionEvents(res, 'json');
-      expect(adminService.exportSubscriptionEvents).toHaveBeenCalledWith({
-        format: 'json',
-      });
-      expect(res.setHeader).toHaveBeenCalledWith(
-        'Content-Type',
-        'application/json; charset=utf-8',
-      );
-      expect(res.json).toHaveBeenCalledWith([{ id: 'ev-1' }]);
     });
   });
 
@@ -730,11 +797,19 @@ describe('AdminController', () => {
             authenticatedPerMinute: 200,
             burstMultiplier: 3,
           },
+          adConfig: {
+            effectiveEcpm: 2.5,
+            canvasAdDensity: 40,
+            maxCanvasAds: 8,
+          },
         },
         mockReq,
       );
       expect(updated.retentionDays).toBe(120);
       expect(updated.rateLimits.authenticatedPerMinute).toBe(200);
+      expect(updated.adConfig.effectiveEcpm).toBe(2.5);
+      expect(updated.adConfig.canvasAdDensity).toBe(40);
+      expect(updated.adConfig.maxCanvasAds).toBe(8);
       expect(adminService.updateSystemSettings).toHaveBeenCalledWith(
         {
           retentionDays: 120,
@@ -743,9 +818,38 @@ describe('AdminController', () => {
             authenticatedPerMinute: 200,
             burstMultiplier: 3,
           },
+          adConfig: {
+            effectiveEcpm: 2.5,
+            canvasAdDensity: 40,
+            maxCanvasAds: 8,
+          },
         },
         mockReq.identity,
       );
+    });
+
+    it('updates synonym configuration dictionary', async () => {
+      const mockReq = {
+        identity: { userId: 'admin-1', role: 'admin' },
+      } as any;
+      (adminService.updateSystemSettings as jest.Mock).mockResolvedValueOnce({
+        retentionDays: 90,
+        synonymsConfig: {
+          hnsw: ['hierarchical navigable small world'],
+        },
+      });
+
+      const updated = await controller.updateSettings(
+        {
+          synonymsConfig: {
+            hnsw: ['hierarchical navigable small world'],
+          },
+        },
+        mockReq,
+      );
+      expect(updated.synonymsConfig?.hnsw).toEqual([
+        'hierarchical navigable small world',
+      ]);
     });
   });
 
@@ -826,6 +930,148 @@ describe('AdminController', () => {
           offset: 0,
         },
       );
+    });
+  });
+
+  describe('plans management', () => {
+    it('returns all plan definitions', async () => {
+      const res = await controller.getPlans();
+      expect(res).toHaveLength(2);
+      expect(plansService.getPlanDefinitions).toHaveBeenCalled();
+    });
+
+    it('returns a single plan definition', async () => {
+      const res = await controller.getPlan('REGISTERED');
+      expect(res.tier).toBe('REGISTERED');
+      expect(plansService.getPlanDefinition).toHaveBeenCalledWith('REGISTERED');
+    });
+
+    it('updates a plan definition and logs audit', async () => {
+      adminService.recordAuditEvent = jest.fn().mockResolvedValue(undefined);
+      const res = await controller.updatePlan('REGISTERED', {
+        name: 'Registered Updated',
+      });
+      expect(res.tier).toBe('REGISTERED');
+      expect(res.version).toBe(2);
+      expect(plansService.updatePlanDefinition).toHaveBeenCalledWith(
+        'REGISTERED',
+        { name: 'Registered Updated' },
+        undefined,
+      );
+    });
+
+    it('gets ad analytics summary with optional range', async () => {
+      const res = await controller.getAdAnalytics('7d');
+      expect(res.totalImpressions).toBe(120);
+      expect(res.totalCulled).toBe(40);
+      expect(plansService.getAdAnalytics).toHaveBeenCalledWith({ range: '7d' });
+    });
+
+    it('exports ad telemetry as CSV', async () => {
+      const mockRes = {
+        setHeader: jest.fn(),
+        send: jest.fn(),
+      } as unknown as Response;
+
+      await controller.exportAdTelemetry(mockRes, '30d');
+      expect(plansService.exportAdTelemetryCsv).toHaveBeenCalledWith('30d');
+      expect(mockRes.setHeader).toHaveBeenCalledWith(
+        'Content-Type',
+        'text/csv; charset=utf-8',
+      );
+      expect(mockRes.send).toHaveBeenCalledWith('id,eventType\n1,impression');
+    });
+
+    it('triggers ad telemetry daily rollup and logs audit', async () => {
+      adminService.recordAuditEvent = jest.fn().mockResolvedValue(undefined);
+      const res = await controller.triggerAdTelemetryRollup(
+        { targetDate: '2026-09-16' },
+        { identity: { userId: 'admin-1', role: 'admin' } } as any,
+      );
+      expect(res.success).toBe(true);
+      expect(plansService.rollupAdTelemetryDaily).toHaveBeenCalledWith(
+        '2026-09-16',
+      );
+      expect(adminService.recordAuditEvent).toHaveBeenCalledWith(
+        expect.objectContaining({
+          action: 'ad_telemetry_rollup',
+          targetType: 'system',
+        }),
+      );
+    });
+
+    it('purges old ad telemetry and logs audit event', async () => {
+      adminService.recordAuditEvent = jest.fn().mockResolvedValue(undefined);
+      const res = await controller.purgeOldAdTelemetry({ retentionDays: 90 }, {
+        identity: { userId: 'admin-1', role: 'admin', email: 'admin@test.com' },
+      } as any);
+      expect(res).toEqual({
+        success: true,
+        purgedCount: 15,
+        retentionDays: 90,
+      });
+      expect(plansService.purgeOldAdTelemetryEvents).toHaveBeenCalledWith(90);
+      expect(adminService.recordAuditEvent).toHaveBeenCalledWith(
+        expect.objectContaining({
+          action: 'ad_telemetry_purge',
+          targetType: 'system',
+          targetId: 'ad_telemetry',
+          actorId: 'admin-1',
+          actorEmail: 'admin@test.com',
+          details: { success: true, purgedCount: 15, retentionDays: 90 },
+        }),
+      );
+    });
+
+    it('gets ad telemetry status', async () => {
+      const res = await controller.getAdTelemetryStatus();
+      expect(res).toEqual(
+        expect.objectContaining({
+          totalEventsCount: 100,
+          totalRollupsCount: 10,
+          retentionDays: 90,
+          autoRollupEnabled: true,
+          scheduleIntervalHours: 24,
+        }),
+      );
+      expect(plansService.getAdTelemetryStatus).toHaveBeenCalled();
+    });
+
+    it('gets all ad context tags', async () => {
+      const tags = await controller.getAdTags('true');
+      expect(tags).toHaveLength(1);
+      expect(adContextService.getAllTags).toHaveBeenCalledWith(true);
+    });
+
+    it('gets ad tag stats', async () => {
+      const stats = await controller.getAdTagStats();
+      expect(stats.totalTags).toBe(1);
+      expect(adContextService.getTagStats).toHaveBeenCalled();
+    });
+
+    it('creates a new ad tag', async () => {
+      const created = await controller.createAdTag({
+        name: 'Cybersecurity',
+        description: 'Info sec and encryption',
+      });
+      expect(created.slug).toBe('cybersecurity');
+      expect(adContextService.createTag).toHaveBeenCalled();
+    });
+
+    it('updates an ad tag', async () => {
+      const updated = await controller.updateAdTag('tag-1', {
+        name: 'AI Updated',
+      });
+      expect(updated.name).toBe('AI Updated');
+      expect(adContextService.updateTag).toHaveBeenCalledWith('tag-1', {
+        name: 'AI Updated',
+      });
+    });
+
+    it('deletes an ad tag', async () => {
+      const res = await controller.deleteAdTag('tag-1');
+      expect(res).toEqual({ success: true });
+      expect(adContextService.deleteTag).toHaveBeenCalledWith('tag-1');
     });
   });
 });

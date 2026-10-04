@@ -30,16 +30,15 @@ export function defineAbilityFor(
 
   can('read', 'Graph', { isPublic: true });
   can('query', 'Graph', { isPublic: true });
-  can('copy', 'Graph', { isPublic: true });
   can('read', 'Source', { graphIsPublic: true });
 
   if (identity) {
     can('read', 'Graph', { userId: identity.userId });
     can('query', 'Graph', { userId: identity.userId });
-    can('copy', 'Graph', { userId: identity.userId });
     can('read', 'Source', { graphUserId: identity.userId });
 
-    if (!identity.isGuest) {
+    if (!identity.isGuest && identity.tier === 'REGISTERED') {
+      can('copy', 'Graph');
       can('create', 'Graph');
       can('update', 'Graph', { userId: identity.userId });
       can('delete', 'Graph', { userId: identity.userId });

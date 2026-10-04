@@ -2,6 +2,7 @@ import {
   BadRequestException,
   Injectable,
   NotFoundException,
+  Optional,
 } from '@nestjs/common';
 import { gunzipSync, gzipSync } from 'node:zlib';
 
@@ -10,7 +11,18 @@ import { RabbitMqService } from '../../common/services/rabbitmq.service.js';
 import { RedisService } from '../../common/services/redis.service.js';
 import { StorageService } from '../../common/services/storage.service.js';
 import { WeaviateService } from '../../common/services/weaviate.service.js';
-import type { ViewerIdentity } from '../../common/types.js';
+import { SimilarityQueueService } from '../../common/services/similarity-queue.service.js';
+import type {
+  AdminGraphDetailsRow,
+  AdminGraphInspectionRow,
+  AdminSourceInspectionRow,
+  AdminUserDetailsRow,
+  AdminUserExportRow,
+  AdminUserGraphRow,
+  AdminUserRecentQueryRow,
+  AdminUserRow,
+  ViewerIdentity,
+} from '../../common/types.js';
 
 @Injectable()
 export class AdminService {
@@ -20,6 +32,7 @@ export class AdminService {
     private readonly rabbitMq: RabbitMqService,
     private readonly weaviate: WeaviateService,
     private readonly storage: StorageService,
+    @Optional() private readonly similarityQueue?: SimilarityQueueService,
   ) {}
 
   async health(): Promise<{
@@ -61,40 +74,30 @@ export class AdminService {
   }
 
   async getOverviewStats() {
-    const [
-      userCounts,
-      graphCounts,
-      storageCounts,
-      queryCounts,
-      hourlyQueries,
-      recentBilling,
-      billingRevenue,
-      monthlyRevenueData,
-    ] = await Promise.all([
-      this.database.one<{
-        totalUsers: string;
-        proUsers: string;
-        freeUsers: string;
-        anonymousUsers: string;
-        newUsers30d: string;
-      }>(`
+    const [userCounts, graphCounts, storageCounts, queryCounts, hourlyQueries] =
+      await Promise.all([
+        this.database.one<{
+          totalUsers: string;
+          registeredUsers: string;
+          anonymousUsers: string;
+          newUsers30d: string;
+        }>(`
         SELECT
           COUNT(*)::text AS "totalUsers",
-          COUNT(*) FILTER (WHERE "subscriptionTier" = 'PRO')::text AS "proUsers",
-          COUNT(*) FILTER (WHERE "subscriptionTier" = 'FREE' AND "isAnonymous" = false)::text AS "freeUsers",
-          COUNT(*) FILTER (WHERE "isAnonymous" = true)::text AS "anonymousUsers",
+          COUNT(*) FILTER (WHERE "subscriptionTier" = 'REGISTERED' AND "isAnonymous" = false)::text AS "registeredUsers",
+          COUNT(*) FILTER (WHERE "isAnonymous" = true OR "subscriptionTier" = 'ANONYMOUS')::text AS "anonymousUsers",
           COUNT(*) FILTER (WHERE "createdAt" >= NOW() - INTERVAL '30 days')::text AS "newUsers30d"
         FROM "User"
       `),
-      this.database.one<{
-        totalGraphs: string;
-        publicGraphs: string;
-        privateGraphs: string;
-        activeGraphs: string;
-        inactiveGraphs: string;
-        scheduledDeletionGraphs: string;
-        exemptGraphs: string;
-      }>(`
+        this.database.one<{
+          totalGraphs: string;
+          publicGraphs: string;
+          privateGraphs: string;
+          activeGraphs: string;
+          inactiveGraphs: string;
+          scheduledDeletionGraphs: string;
+          exemptGraphs: string;
+        }>(`
         SELECT
           COUNT(*)::text AS "totalGraphs",
           COUNT(*) FILTER (WHERE "isPublic" = true)::text AS "publicGraphs",
@@ -105,30 +108,30 @@ export class AdminService {
           COUNT(*) FILTER (WHERE "isExemptFromRetention" = true)::text AS "exemptGraphs"
         FROM "Graph"
       `),
-      this.database.one<{
-        totalSources: string;
-        totalStorageBytes: string;
-        archivesCount: string;
-        archivesBytes: string;
-      }>(`
+        this.database.one<{
+          totalSources: string;
+          totalStorageBytes: string;
+          archivesCount: string;
+          archivesBytes: string;
+        }>(`
         SELECT
           (SELECT COUNT(*)::text FROM "NodeSource") AS "totalSources",
           (SELECT COALESCE(SUM("sizeBytes"), 0)::text FROM "NodeSource") AS "totalStorageBytes",
           (SELECT COUNT(*)::text FROM "GraphArchive") AS "archivesCount",
           (SELECT COALESCE(SUM("sizeBytes"), 0)::text FROM "GraphArchive") AS "archivesBytes"
       `),
-      this.database.one<{
-        totalQueries: string;
-        queriesToday: string;
-        queriesLastHour: string;
-      }>(`
+        this.database.one<{
+          totalQueries: string;
+          queriesToday: string;
+          queriesLastHour: string;
+        }>(`
         SELECT
           COUNT(*)::text AS "totalQueries",
           COUNT(*) FILTER (WHERE "createdAt" >= NOW() - INTERVAL '24 hours')::text AS "queriesToday",
           COUNT(*) FILTER (WHERE "createdAt" >= NOW() - INTERVAL '1 hour')::text AS "queriesLastHour"
         FROM "Query"
       `),
-      this.database.query<{ hour: string; count: string }>(`
+        this.database.query<{ hour: string; count: string }>(`
         SELECT
           to_char(date_trunc('hour', "createdAt"), 'YYYY-MM-DD"T"HH24:00:00"Z"') AS "hour",
           COUNT(*)::text AS "count"
@@ -137,137 +140,35 @@ export class AdminService {
         GROUP BY date_trunc('hour', "createdAt")
         ORDER BY date_trunc('hour', "createdAt") ASC
       `),
-      this.database.query<{
-        id: string;
-        userId: string;
-        eventType: string;
-        provider: string;
-        createdAt: Date;
-      }>(`
-        SELECT "id", "userId", "eventType", "provider", "createdAt"
-        FROM "BillingEvent"
-        ORDER BY "createdAt" DESC
-        LIMIT 5
-      `),
-      this.database.one<{
-        totalBillingRevenue: string;
-        paidEventsCount: string;
-      }>(`
-        SELECT
-          COALESCE(
-            SUM(
-              CASE
-                WHEN (payload->'data'->'attributes'->>'total') ~ '^[0-9]+$'
-                  THEN (payload->'data'->'attributes'->>'total')::numeric / 100
-                WHEN (payload->>'amountUsd') ~ '^[0-9]+(\.[0-9]+)?$'
-                  THEN (payload->>'amountUsd')::numeric
-                WHEN (payload->>'total') ~ '^[0-9]+(\.[0-9]+)?$'
-                  THEN (payload->>'total')::numeric
-                ELSE 10.00
-              END
-            ),
-            0
-          )::numeric(12,2)::text AS "totalBillingRevenue",
-          COUNT(*)::text AS "paidEventsCount"
-        FROM "BillingEvent"
-        WHERE "eventType" IN (
-          'order_created',
-          'subscription_created',
-          'subscription_payment_success',
-          'payment_success',
-          'admin_grant'
-        )
-      `),
-      this.database.query<{
-        monthKey: string;
-        monthLabel: string;
-        revenue: string;
-        eventsCount: string;
-      }>(`
-        SELECT
-          to_char(date_trunc('month', "createdAt"), 'YYYY-MM') AS "monthKey",
-          to_char(date_trunc('month', "createdAt"), 'Mon YYYY') AS "monthLabel",
-          COALESCE(
-            SUM(
-              CASE
-                WHEN (payload->'data'->'attributes'->>'total') ~ '^[0-9]+$'
-                  THEN (payload->'data'->'attributes'->>'total')::numeric / 100
-                WHEN (payload->>'amountUsd') ~ '^[0-9]+(\.[0-9]+)?$'
-                  THEN (payload->>'amountUsd')::numeric
-                WHEN (payload->>'total') ~ '^[0-9]+(\.[0-9]+)?$'
-                  THEN (payload->>'total')::numeric
-                ELSE 10.00
-              END
-            ),
-            0
-          )::numeric(12,2)::text AS "revenue",
-          COUNT(*)::text AS "eventsCount"
-        FROM "BillingEvent"
-        WHERE "eventType" IN (
-          'order_created',
-          'subscription_created',
-          'subscription_payment_success',
-          'payment_success',
-          'admin_grant'
-        )
-        GROUP BY date_trunc('month', "createdAt")
-        ORDER BY date_trunc('month', "createdAt") ASC
-      `),
-    ]);
+      ]);
 
-    const proCount = Number(userCounts?.proUsers ?? '0');
-    const monthlyRevenue = proCount * 10;
     const totalQueries24h = Number(queryCounts?.queriesToday ?? '0');
     const avgRequestsPerHour = Math.round((totalQueries24h / 24) * 10) / 10;
     const currentRequestsPerHour = Number(queryCounts?.queriesLastHour ?? '0');
 
-    const billingRevenueNum = Number.parseFloat(
-      billingRevenue?.totalBillingRevenue ?? '0',
-    );
-    const effectiveTotalRevenue =
-      billingRevenueNum > 0
-        ? Math.round(billingRevenueNum * 100) / 100
-        : monthlyRevenue;
-
-    const currentMonthKey = new Date().toISOString().slice(0, 7);
-    const currentMonthLabel = new Intl.DateTimeFormat('en-US', {
-      month: 'short',
-      year: 'numeric',
-    }).format(new Date());
-
-    let monthlyDistribution = (monthlyRevenueData || []).map((m) => ({
-      month: m.monthKey,
-      label: m.monthLabel,
-      revenue: Number.parseFloat(m.revenue) || 0,
-      eventsCount: Number.parseInt(m.eventsCount, 10) || 0,
-    }));
-
-    if (monthlyDistribution.length === 0 && effectiveTotalRevenue > 0) {
-      monthlyDistribution = [
-        {
-          month: currentMonthKey,
-          label: currentMonthLabel,
-          revenue: effectiveTotalRevenue,
-          eventsCount: proCount,
-        },
-      ];
-    }
+    const systemSettings = await this.getSystemSettings();
+    const queueOccupation =
+      (await this.redis.get('queue:similarity:occupation')) ?? 'low';
 
     return {
       users: {
         total: Number(userCounts?.totalUsers ?? '0'),
-        pro: proCount,
-        free: Number(userCounts?.freeUsers ?? '0'),
+        registered: Number(userCounts?.registeredUsers ?? '0'),
         anonymous: Number(userCounts?.anonymousUsers ?? '0'),
         newLast30Days: Number(userCounts?.newUsers30d ?? '0'),
       },
-      revenue: {
-        monthlyRecurringRevenue: monthlyRevenue,
-        totalRevenue: effectiveTotalRevenue,
-        proPriceUsd: 10,
-        activeSubscriptions: proCount,
-        recentEvents: recentBilling,
-        monthlyDistribution,
+      similarityQueue: {
+        occupation: queueOccupation,
+        anonymousThroughputPerMinute:
+          systemSettings.similarityQuota.anonymousThroughputPerMinute,
+        registeredThroughputPerMinute:
+          systemSettings.similarityQuota.registeredThroughputPerMinute,
+      },
+      storageQuota: {
+        defaultStorageLimitMb:
+          systemSettings.storageConfig.defaultStorageLimitMb,
+        totalStorageBytes: Number(storageCounts?.totalStorageBytes ?? '0'),
+        totalSources: Number(storageCounts?.totalSources ?? '0'),
       },
       requests: {
         totalQueries: Number(queryCounts?.totalQueries ?? '0'),
@@ -304,6 +205,8 @@ export class AdminService {
     limit?: number;
     search?: string;
     tier?: string;
+    storageFilter?: 'ALL' | 'HIGH_USAGE' | 'HAS_STORAGE';
+    activityFilter?: 'ALL' | 'ACTIVE' | 'INACTIVE';
   }) {
     const page = Math.max(1, params.page ?? 1);
     const limit = Math.min(100, Math.max(1, params.limit ?? 20));
@@ -331,17 +234,37 @@ export class AdminService {
       }
     }
 
+    if (params.storageFilter === 'HIGH_USAGE') {
+      conditions.push(
+        `(SELECT COALESCE(SUM(s."sizeBytes"), 0) FROM "NodeSource" s JOIN "Graph" g ON g."id" = s."graphId" WHERE g."userId" = u."id") >= (COALESCE(u."storageLimitMb", 100) * 1024 * 1024 * 0.8)`,
+      );
+    } else if (params.storageFilter === 'HAS_STORAGE') {
+      conditions.push(
+        `EXISTS (SELECT 1 FROM "NodeSource" s JOIN "Graph" g ON g."id" = s."graphId" WHERE g."userId" = u."id")`,
+      );
+    }
+
+    if (params.activityFilter === 'ACTIVE') {
+      conditions.push(
+        `(EXISTS (SELECT 1 FROM "Graph" g WHERE g."userId" = u."id") OR EXISTS (SELECT 1 FROM "Query" q WHERE q."userId" = u."id"))`,
+      );
+    } else if (params.activityFilter === 'INACTIVE') {
+      conditions.push(
+        `(NOT EXISTS (SELECT 1 FROM "Graph" g WHERE g."userId" = u."id") AND NOT EXISTS (SELECT 1 FROM "Query" q WHERE q."userId" = u."id"))`,
+      );
+    }
+
     const whereClause = conditions.length
       ? `WHERE ${conditions.join(' AND ')}`
       : '';
 
     const totalRow = await this.database.one<{ total: string }>(
-      `SELECT COUNT(*)::text AS "total" FROM "User" ${whereClause}`,
+      `SELECT COUNT(*)::text AS "total" FROM "User" u ${whereClause}`,
       values,
     );
     const total = Number(totalRow?.total ?? '0');
 
-    const users = await this.database.query<any>(
+    const users = await this.database.query<AdminUserRow>(
       `SELECT
          u."id",
          u."name",
@@ -349,12 +272,14 @@ export class AdminService {
          u."username",
          u."isAnonymous",
          u."subscriptionTier",
-         u."subscriptionExpiresAt",
+         NULL::timestamp with time zone AS "subscriptionExpiresAt",
+         u."storageLimitMb",
          u."preferredLanguage",
          u."createdAt",
          u."updatedAt",
          (SELECT COUNT(*)::int FROM "Graph" g WHERE g."userId" = u."id") AS "graphsCount",
-         (SELECT COUNT(*)::int FROM "NodeSource" s JOIN "Graph" g ON g."id" = s."graphId" WHERE g."userId" = u."id") AS "sourcesCount"
+         (SELECT COUNT(*)::int FROM "NodeSource" s JOIN "Graph" g ON g."id" = s."graphId" WHERE g."userId" = u."id") AS "sourcesCount",
+         (SELECT COALESCE(SUM(s."sizeBytes"), 0)::bigint FROM "NodeSource" s JOIN "Graph" g ON g."id" = s."graphId" WHERE g."userId" = u."id") AS "usedStorageBytes"
        FROM "User" u
        ${whereClause}
        ORDER BY u."createdAt" DESC
@@ -374,7 +299,7 @@ export class AdminService {
   }
 
   async getUserDetails(id: string) {
-    const user = await this.database.one<any>(
+    const user = await this.database.one<AdminUserDetailsRow>(
       `SELECT
          u."id",
          u."name",
@@ -382,8 +307,8 @@ export class AdminService {
          u."username",
          u."isAnonymous",
          u."subscriptionTier",
-         u."subscriptionExpiresAt",
-         u."lemonSqueezyCustomerId",
+         NULL::timestamp with time zone AS "subscriptionExpiresAt",
+         u."storageLimitMb",
          u."preferredLanguage",
          u."createdAt",
          u."updatedAt"
@@ -395,39 +320,32 @@ export class AdminService {
       throw new NotFoundException(`User ${id} not found.`);
     }
 
-    const [graphs, recentQueries, billingEvents, storageUsage] =
-      await Promise.all([
-        this.database.query<any>(
-          `SELECT "id", "title", "isPublic", "isExemptFromRetention", "lastAccessedAt", "createdAt"
+    const [graphs, recentQueries, storageUsage] = await Promise.all([
+      this.database.query<AdminUserGraphRow>(
+        `SELECT "id", "title", "isPublic", "isExemptFromRetention", "lastAccessedAt", "createdAt"
          FROM "Graph" WHERE "userId" = $1 ORDER BY "updatedAt" DESC`,
-          [id],
-        ),
-        this.database.query<any>(
-          `SELECT "id", "graphId", "queryText", "createdAt"
+        [id],
+      ),
+      this.database.query<AdminUserRecentQueryRow>(
+        `SELECT "id", "graphId", "queryText", "createdAt"
          FROM "Query" WHERE "userId" = $1 ORDER BY "createdAt" DESC LIMIT 10`,
-          [id],
-        ),
-        this.database.query<any>(
-          `SELECT "id", "provider", "eventType", "createdAt"
-         FROM "BillingEvent" WHERE "userId" = $1 ORDER BY "createdAt" DESC LIMIT 10`,
-          [id],
-        ),
-        this.database.one<{ totalBytes: string; count: string }>(
-          `SELECT
+        [id],
+      ),
+      this.database.one<{ totalBytes: string; count: string }>(
+        `SELECT
            COALESCE(SUM(s."sizeBytes"), 0)::text AS "totalBytes",
            COUNT(s.*)::text AS "count"
          FROM "NodeSource" s
          JOIN "Graph" g ON g."id" = s."graphId"
          WHERE g."userId" = $1`,
-          [id],
-        ),
-      ]);
+        [id],
+      ),
+    ]);
 
     return {
       user,
       graphs,
       recentQueries,
-      billingEvents,
       storage: {
         sourcesCount: Number(storageUsage?.count ?? '0'),
         totalBytes: Number(storageUsage?.totalBytes ?? '0'),
@@ -442,6 +360,7 @@ export class AdminService {
       username?: string;
       subscriptionTier?: string;
       subscriptionExpiresAt?: string | null;
+      storageLimitMb?: number | null;
     },
     actor?: ViewerIdentity,
   ) {
@@ -465,19 +384,18 @@ export class AdminService {
     }
     if (data.subscriptionTier !== undefined) {
       const tier = data.subscriptionTier.toUpperCase();
-      if (!['FREE', 'PRO', 'ANONYMOUS'].includes(tier)) {
+      if (!['REGISTERED', 'ANONYMOUS'].includes(tier)) {
         throw new BadRequestException(`Invalid subscription tier: ${tier}`);
       }
       updates.push(`"subscriptionTier" = $${idx++}`);
       values.push(tier);
     }
-    if (data.subscriptionExpiresAt !== undefined) {
-      updates.push(`"subscriptionExpiresAt" = $${idx++}`);
-      values.push(
-        data.subscriptionExpiresAt
-          ? new Date(data.subscriptionExpiresAt)
-          : null,
-      );
+    if (data.storageLimitMb !== undefined) {
+      if (data.storageLimitMb !== null && data.storageLimitMb < 0) {
+        throw new BadRequestException('Storage limit cannot be negative.');
+      }
+      updates.push(`"storageLimitMb" = $${idx++}`);
+      values.push(data.storageLimitMb);
     }
 
     if (updates.length === 0) return this.getUserDetails(id);
@@ -501,6 +419,37 @@ export class AdminService {
     });
 
     return details;
+  }
+
+  async updateUserStorageLimit(
+    id: string,
+    storageLimitMb: number | null,
+    actor?: ViewerIdentity,
+  ) {
+    if (storageLimitMb !== null && storageLimitMb < 0) {
+      throw new BadRequestException('Storage limit cannot be negative.');
+    }
+    const user = await this.database.one<{ id: string; email: string }>(
+      'SELECT "id", "email" FROM "User" WHERE "id" = $1',
+      [id],
+    );
+    if (!user) throw new NotFoundException(`User ${id} not found.`);
+
+    await this.database.query(
+      'UPDATE "User" SET "storageLimitMb" = $1, "updatedAt" = CURRENT_TIMESTAMP WHERE "id" = $2',
+      [storageLimitMb, id],
+    );
+
+    await this.recordAuditEvent({
+      actorId: actor?.userId ?? 'admin',
+      actorEmail: actor?.email ?? undefined,
+      action: 'user.storage_limit_update',
+      targetType: 'user',
+      targetId: id,
+      details: { storageLimitMb },
+    });
+
+    return { id, storageLimitMb };
   }
 
   async deleteUser(id: string, actor?: ViewerIdentity) {
@@ -584,7 +533,7 @@ export class AdminService {
     );
     const total = Number(totalRow?.total ?? '0');
 
-    const graphs = await this.database.query<any>(
+    const graphs = await this.database.query<AdminGraphInspectionRow>(
       `SELECT
          g."id",
          g."title",
@@ -621,7 +570,7 @@ export class AdminService {
   }
 
   async getGraphDetails(id: string) {
-    const graph = await this.database.one<any>(
+    const graph = await this.database.one<AdminGraphDetailsRow>(
       `SELECT
          g."id",
          g."title",
@@ -645,7 +594,7 @@ export class AdminService {
     );
     if (!graph) throw new NotFoundException(`Graph ${id} not found.`);
 
-    const sources = await this.database.query<any>(
+    const sources = await this.database.query<AdminSourceInspectionRow>(
       `SELECT "id", "nodeId", "name", "fileType", "fileUrl", "sizeBytes", "status", "createdAt"
        FROM "NodeSource" WHERE "graphId" = $1`,
       [id],
@@ -827,136 +776,13 @@ export class AdminService {
     return { deleted: true, graphId };
   }
 
-  async getSubscriptionEvents(params: { page?: number; limit?: number }) {
-    const page = Math.max(1, params.page ?? 1);
-    const limit = Math.min(100, Math.max(1, params.limit ?? 20));
-    const offset = (page - 1) * limit;
-
-    const totalRow = await this.database.one<{ total: string }>(
-      'SELECT COUNT(*)::text AS "total" FROM "BillingEvent"',
-    );
-    const total = Number(totalRow?.total ?? '0');
-
-    const events = await this.database.query<any>(
-      `SELECT
-         b."id",
-         b."userId",
-         b."provider",
-         b."externalEventId",
-         b."eventType",
-         b."payload",
-         b."createdAt",
-         u."email" AS "userEmail",
-         u."name" AS "userName"
-       FROM "BillingEvent" b
-       LEFT JOIN "User" u ON u."id" = b."userId"
-       ORDER BY b."createdAt" DESC
-       LIMIT $1 OFFSET $2`,
-      [limit, offset],
-    );
-
-    return {
-      events,
-      pagination: {
-        total,
-        page,
-        limit,
-        totalPages: Math.ceil(total / limit),
-      },
-    };
-  }
-
-  async grantSubscription(
-    userId: string,
-    tier: 'PRO' = 'PRO',
-    durationDays = 30,
-    actor?: ViewerIdentity,
-  ) {
-    const user = await this.database.one(
-      'SELECT "id" FROM "User" WHERE "id" = $1',
-      [userId],
-    );
-    if (!user) throw new NotFoundException(`User ${userId} not found.`);
-
-    const expiresAt = new Date();
-    expiresAt.setDate(expiresAt.getDate() + durationDays);
-
-    await this.database.query(
-      `UPDATE "User"
-       SET "subscriptionTier" = $1, "subscriptionExpiresAt" = $2, "updatedAt" = CURRENT_TIMESTAMP
-       WHERE "id" = $3`,
-      [tier, expiresAt, userId],
-    );
-
-    const eventId = `admin-grant-${Date.now()}`;
-    await this.database.query(
-      `INSERT INTO "BillingEvent" ("id", "userId", "provider", "eventType", "payload", "createdAt")
-       VALUES ($1, $2, 'LOCAL', 'admin_granted_pro', $3::jsonb, CURRENT_TIMESTAMP)`,
-      [
-        eventId,
-        userId,
-        JSON.stringify({
-          grantedBy: actor?.email ?? actor?.userId ?? 'admin',
-          durationDays,
-          expiresAt,
-        }),
-      ],
-    );
-
-    await this.recordAuditEvent({
-      actorId: actor?.userId ?? 'admin',
-      actorEmail: actor?.email ?? undefined,
-      action: 'subscription.grant',
-      targetType: 'subscription',
-      targetId: userId,
-      details: { tier, durationDays, expiresAt: expiresAt.toISOString() },
-    });
-
-    return this.getUserDetails(userId);
-  }
-
-  async revokeSubscription(userId: string, actor?: ViewerIdentity) {
-    const user = await this.database.one(
-      'SELECT "id" FROM "User" WHERE "id" = $1',
-      [userId],
-    );
-    if (!user) throw new NotFoundException(`User ${userId} not found.`);
-
-    await this.database.query(
-      `UPDATE "User"
-       SET "subscriptionTier" = 'FREE', "subscriptionExpiresAt" = NULL, "updatedAt" = CURRENT_TIMESTAMP
-       WHERE "id" = $1`,
-      [userId],
-    );
-
-    const eventId = `admin-revoke-${Date.now()}`;
-    await this.database.query(
-      `INSERT INTO "BillingEvent" ("id", "userId", "provider", "eventType", "payload", "createdAt")
-       VALUES ($1, $2, 'LOCAL', 'admin_revoked_pro', $3::jsonb, CURRENT_TIMESTAMP)`,
-      [
-        eventId,
-        userId,
-        JSON.stringify({ revokedBy: actor?.email ?? actor?.userId ?? 'admin' }),
-      ],
-    );
-
-    await this.recordAuditEvent({
-      actorId: actor?.userId ?? 'admin',
-      actorEmail: actor?.email ?? undefined,
-      action: 'subscription.revoke',
-      targetType: 'subscription',
-      targetId: userId,
-      details: {},
-    });
-
-    return this.getUserDetails(userId);
-  }
-
   // 7. Audit Log Export (CSV / JSON)
   async exportUsers(params: {
     format: 'csv' | 'json';
     search?: string;
     tier?: string;
+    storageFilter?: 'ALL' | 'HIGH_USAGE' | 'HAS_STORAGE';
+    activityFilter?: 'ALL' | 'ACTIVE' | 'INACTIVE';
   }) {
     const conditions: string[] = [];
     const values: any[] = [];
@@ -980,11 +806,31 @@ export class AdminService {
       }
     }
 
+    if (params.storageFilter === 'HIGH_USAGE') {
+      conditions.push(
+        `(SELECT COALESCE(SUM(s."sizeBytes"), 0) FROM "NodeSource" s JOIN "Graph" g ON g."id" = s."graphId" WHERE g."userId" = u."id") >= (COALESCE(u."storageLimitMb", 100) * 1024 * 1024 * 0.8)`,
+      );
+    } else if (params.storageFilter === 'HAS_STORAGE') {
+      conditions.push(
+        `EXISTS (SELECT 1 FROM "NodeSource" s JOIN "Graph" g ON g."id" = s."graphId" WHERE g."userId" = u."id")`,
+      );
+    }
+
+    if (params.activityFilter === 'ACTIVE') {
+      conditions.push(
+        `(EXISTS (SELECT 1 FROM "Graph" g WHERE g."userId" = u."id") OR EXISTS (SELECT 1 FROM "Query" q WHERE q."userId" = u."id"))`,
+      );
+    } else if (params.activityFilter === 'INACTIVE') {
+      conditions.push(
+        `(NOT EXISTS (SELECT 1 FROM "Graph" g WHERE g."userId" = u."id") AND NOT EXISTS (SELECT 1 FROM "Query" q WHERE q."userId" = u."id"))`,
+      );
+    }
+
     const whereClause = conditions.length
       ? `WHERE ${conditions.join(' AND ')}`
       : '';
 
-    const users = await this.database.query<any>(
+    const users = await this.database.query<AdminUserExportRow>(
       `SELECT
          u."id",
          u."name",
@@ -992,10 +838,12 @@ export class AdminService {
          u."username",
          u."isAnonymous",
          u."subscriptionTier",
-         u."subscriptionExpiresAt",
+         NULL::timestamp with time zone AS "subscriptionExpiresAt",
+         u."storageLimitMb",
          u."createdAt",
          (SELECT COUNT(*)::int FROM "Graph" g WHERE g."userId" = u."id") AS "graphsCount",
-         (SELECT COUNT(*)::int FROM "NodeSource" s JOIN "Graph" g ON g."id" = s."graphId" WHERE g."userId" = u."id") AS "sourcesCount"
+         (SELECT COUNT(*)::int FROM "NodeSource" s JOIN "Graph" g ON g."id" = s."graphId" WHERE g."userId" = u."id") AS "sourcesCount",
+         (SELECT COALESCE(SUM(s."sizeBytes"), 0)::bigint FROM "NodeSource" s JOIN "Graph" g ON g."id" = s."graphId" WHERE g."userId" = u."id") AS "usedStorageBytes"
        FROM "User" u
        ${whereClause}
        ORDER BY u."createdAt" DESC
@@ -1012,6 +860,8 @@ export class AdminService {
         { key: 'isAnonymous', label: 'Anonymous' },
         { key: 'subscriptionTier', label: 'Subscription Tier' },
         { key: 'subscriptionExpiresAt', label: 'Subscription Expires At' },
+        { key: 'storageLimitMb', label: 'Storage Limit (MB)' },
+        { key: 'usedStorageBytes', label: 'Used Storage (Bytes)' },
         { key: 'graphsCount', label: 'Graphs Count' },
         { key: 'sourcesCount', label: 'Sources Count' },
         { key: 'createdAt', label: 'Created At' },
@@ -1020,47 +870,6 @@ export class AdminService {
     }
 
     return users;
-  }
-
-  async exportSubscriptionEvents(params: { format: 'csv' | 'json' }) {
-    const events = await this.database.query<any>(
-      `SELECT
-         b."id",
-         b."userId",
-         b."provider",
-         b."externalEventId",
-         b."eventType",
-         b."payload",
-         b."createdAt",
-         u."email" AS "userEmail",
-         u."name" AS "userName"
-       FROM "BillingEvent" b
-       LEFT JOIN "User" u ON u."id" = b."userId"
-       ORDER BY b."createdAt" DESC
-       LIMIT 10000`,
-    );
-
-    if (params.format === 'csv') {
-      const rows = events.map((e) => ({
-        ...e,
-        payloadSummary:
-          typeof e.payload === 'object' ? JSON.stringify(e.payload) : e.payload,
-      }));
-      const columns = [
-        { key: 'id', label: 'Event ID' },
-        { key: 'userId', label: 'User ID' },
-        { key: 'userName', label: 'User Name' },
-        { key: 'userEmail', label: 'User Email' },
-        { key: 'provider', label: 'Provider' },
-        { key: 'eventType', label: 'Event Type' },
-        { key: 'externalEventId', label: 'External Event ID' },
-        { key: 'payloadSummary', label: 'Payload' },
-        { key: 'createdAt', label: 'Created At' },
-      ];
-      return toCsv(rows, columns);
-    }
-
-    return events;
   }
 
   async batchUsers(
@@ -1083,41 +892,17 @@ export class AdminService {
     }
 
     if (dto.action === 'set_tier') {
-      const tier = (dto.tier ?? 'PRO').toUpperCase();
-      if (!['FREE', 'PRO', 'ANONYMOUS'].includes(tier)) {
+      const tier = (dto.tier ?? 'REGISTERED').toUpperCase();
+      if (!['REGISTERED', 'ANONYMOUS'].includes(tier)) {
         throw new BadRequestException(`Invalid subscription tier: ${tier}`);
-      }
-
-      let expiresAt: Date | null = null;
-      if (tier === 'PRO') {
-        const days = dto.durationDays ?? 30;
-        expiresAt = new Date();
-        expiresAt.setDate(expiresAt.getDate() + days);
       }
 
       await this.database.query(
         `UPDATE "User"
-         SET "subscriptionTier" = $1, "subscriptionExpiresAt" = $2, "updatedAt" = CURRENT_TIMESTAMP
-         WHERE "id" = ANY($3)`,
-        [tier, expiresAt, dto.userIds],
+         SET "subscriptionTier" = $1, "updatedAt" = CURRENT_TIMESTAMP
+         WHERE "id" = ANY($2)`,
+        [tier, dto.userIds],
       );
-
-      for (const uid of dto.userIds) {
-        const eventId = `admin-batch-tier-${Date.now()}-${Math.random().toString(36).slice(2, 7)}`;
-        await this.database.query(
-          `INSERT INTO "BillingEvent" ("id", "userId", "provider", "eventType", "payload", "createdAt")
-           VALUES ($1, $2, 'LOCAL', 'admin_batch_tier_change', $3::jsonb, CURRENT_TIMESTAMP)`,
-          [
-            eventId,
-            uid,
-            JSON.stringify({
-              tier,
-              expiresAt,
-              batchSize: dto.userIds.length,
-            }),
-          ],
-        );
-      }
 
       await this.recordAuditEvent({
         actorId: actor?.userId ?? 'admin',
@@ -1127,7 +912,6 @@ export class AdminService {
         details: {
           count: dto.userIds.length,
           tier,
-          expiresAt: expiresAt?.toISOString(),
         },
       });
 
@@ -1136,7 +920,6 @@ export class AdminService {
         action: 'set_tier',
         count: dto.userIds.length,
         tier,
-        expiresAt,
       };
     }
 
@@ -1272,30 +1055,76 @@ export class AdminService {
 
   async getSystemSettings(): Promise<SystemSettings> {
     const raw = await this.redis.get('system:settings');
-    if (!raw) {
-      return DEFAULT_SYSTEM_SETTINGS;
+    let base = DEFAULT_SYSTEM_SETTINGS;
+    if (raw) {
+      try {
+        const parsed = JSON.parse(raw) as Partial<SystemSettings>;
+        base = {
+          ...DEFAULT_SYSTEM_SETTINGS,
+          ...parsed,
+          similarityQuota: {
+            ...DEFAULT_SYSTEM_SETTINGS.similarityQuota,
+            ...(parsed.similarityQuota ?? {}),
+          },
+          storageConfig: {
+            ...DEFAULT_SYSTEM_SETTINGS.storageConfig,
+            ...(parsed.storageConfig ?? {}),
+          },
+          adConfig: {
+            ...DEFAULT_SYSTEM_SETTINGS.adConfig,
+            ...(parsed.adConfig ?? {}),
+          },
+          rateLimits: {
+            ...DEFAULT_SYSTEM_SETTINGS.rateLimits,
+            ...(parsed.rateLimits ?? {}),
+          },
+          maintenanceExemptions: {
+            ...DEFAULT_SYSTEM_SETTINGS.maintenanceExemptions,
+            ...(parsed.maintenanceExemptions ?? {}),
+          },
+          synonymsConfig: {
+            ...DEFAULT_SYSTEM_SETTINGS.synonymsConfig,
+            ...(parsed.synonymsConfig ?? {}),
+          },
+        };
+      } catch {
+        base = DEFAULT_SYSTEM_SETTINGS;
+      }
     }
     try {
-      const parsed = JSON.parse(raw) as Partial<SystemSettings>;
-      return {
-        ...DEFAULT_SYSTEM_SETTINGS,
-        ...parsed,
-        freeTierLimits: {
-          ...DEFAULT_SYSTEM_SETTINGS.freeTierLimits,
-          ...(parsed.freeTierLimits ?? {}),
-        },
-        proTierLimits: {
-          ...DEFAULT_SYSTEM_SETTINGS.proTierLimits,
-          ...(parsed.proTierLimits ?? {}),
-        },
-        rateLimits: {
-          ...DEFAULT_SYSTEM_SETTINGS.rateLimits,
-          ...(parsed.rateLimits ?? {}),
-        },
-      };
+      const rows = await this.database.query<{ key: string; value: any }>(
+        `SELECT "key", "value" FROM "SystemSettings" WHERE "key" IN ('similarityQuota', 'storageConfig', 'adConfig', 'synonymsConfig')`,
+      );
+      for (const row of rows) {
+        if (row.key === 'similarityQuota' && row.value) {
+          base.similarityQuota = {
+            ...base.similarityQuota,
+            ...row.value,
+          };
+        }
+        if (row.key === 'storageConfig' && row.value) {
+          base.storageConfig = {
+            ...base.storageConfig,
+            ...row.value,
+          };
+        }
+        if (row.key === 'adConfig' && row.value) {
+          base.adConfig = {
+            ...base.adConfig,
+            ...row.value,
+          };
+        }
+        if (row.key === 'synonymsConfig' && row.value) {
+          base.synonymsConfig = {
+            ...base.synonymsConfig,
+            ...row.value,
+          };
+        }
+      }
     } catch {
-      return DEFAULT_SYSTEM_SETTINGS;
+      // Table may not be ready during initial boot
     }
+    return base;
   }
 
   async updateSystemSettings(
@@ -1311,51 +1140,31 @@ export class AdminService {
     ) {
       throw new BadRequestException('retentionGraceDays cannot be negative.');
     }
-    if (patch.freeTierLimits) {
+    if (patch.similarityQuota) {
       if (
-        patch.freeTierLimits.maxNodes !== undefined &&
-        patch.freeTierLimits.maxNodes < 1
-      ) {
-        throw new BadRequestException('Free tier maxNodes must be at least 1.');
-      }
-      if (
-        patch.freeTierLimits.maxSourcesPerGraph !== undefined &&
-        patch.freeTierLimits.maxSourcesPerGraph < 1
+        patch.similarityQuota.anonymousThroughputPerMinute !== undefined &&
+        patch.similarityQuota.anonymousThroughputPerMinute < 1
       ) {
         throw new BadRequestException(
-          'Free tier maxSourcesPerGraph must be at least 1.',
+          'anonymousThroughputPerMinute must be at least 1.',
         );
       }
       if (
-        patch.freeTierLimits.maxSourceSizeBytes !== undefined &&
-        patch.freeTierLimits.maxSourceSizeBytes < 1024
+        patch.similarityQuota.registeredThroughputPerMinute !== undefined &&
+        patch.similarityQuota.registeredThroughputPerMinute < 1
       ) {
         throw new BadRequestException(
-          'Free tier maxSourceSizeBytes must be at least 1024 bytes.',
+          'registeredThroughputPerMinute must be at least 1.',
         );
       }
     }
-    if (patch.proTierLimits) {
+    if (patch.storageConfig) {
       if (
-        patch.proTierLimits.maxNodes !== undefined &&
-        patch.proTierLimits.maxNodes < 1
-      ) {
-        throw new BadRequestException('Pro tier maxNodes must be at least 1.');
-      }
-      if (
-        patch.proTierLimits.maxSourcesPerGraph !== undefined &&
-        patch.proTierLimits.maxSourcesPerGraph < 1
+        patch.storageConfig.defaultStorageLimitMb !== undefined &&
+        patch.storageConfig.defaultStorageLimitMb < 1
       ) {
         throw new BadRequestException(
-          'Pro tier maxSourcesPerGraph must be at least 1.',
-        );
-      }
-      if (
-        patch.proTierLimits.maxSourceSizeBytes !== undefined &&
-        patch.proTierLimits.maxSourceSizeBytes < 1024
-      ) {
-        throw new BadRequestException(
-          'Pro tier maxSourceSizeBytes must be at least 1024 bytes.',
+          'defaultStorageLimitMb must be at least 1 MB.',
         );
       }
     }
@@ -1383,18 +1192,65 @@ export class AdminService {
         throw new BadRequestException('burstMultiplier must be at least 1.');
       }
     }
+    if (patch.adConfig) {
+      if (
+        patch.adConfig.effectiveEcpm !== undefined &&
+        (patch.adConfig.effectiveEcpm <= 0 ||
+          Number.isNaN(patch.adConfig.effectiveEcpm))
+      ) {
+        throw new BadRequestException('effectiveEcpm must be greater than 0.');
+      }
+      if (
+        patch.adConfig.canvasAdDensity !== undefined &&
+        patch.adConfig.canvasAdDensity < 1
+      ) {
+        throw new BadRequestException('canvasAdDensity must be at least 1.');
+      }
+      if (
+        patch.adConfig.maxCanvasAds !== undefined &&
+        patch.adConfig.maxCanvasAds < 1
+      ) {
+        throw new BadRequestException('maxCanvasAds must be at least 1.');
+      }
+    }
+
+    if (patch.synonymsConfig !== undefined) {
+      if (
+        typeof patch.synonymsConfig !== 'object' ||
+        patch.synonymsConfig === null
+      ) {
+        throw new BadRequestException('synonymsConfig must be an object.');
+      }
+      for (const [key, val] of Object.entries(patch.synonymsConfig)) {
+        if (!key.trim()) {
+          throw new BadRequestException('Synonym key cannot be empty.');
+        }
+        if (
+          !Array.isArray(val) ||
+          !val.every((item) => typeof item === 'string')
+        ) {
+          throw new BadRequestException(
+            `Synonym for "${key}" must be an array of strings.`,
+          );
+        }
+      }
+    }
 
     const current = await this.getSystemSettings();
     const updated: SystemSettings = {
       ...current,
       ...patch,
-      freeTierLimits: {
-        ...current.freeTierLimits,
-        ...(patch.freeTierLimits ?? {}),
+      similarityQuota: {
+        ...current.similarityQuota,
+        ...(patch.similarityQuota ?? {}),
       },
-      proTierLimits: {
-        ...current.proTierLimits,
-        ...(patch.proTierLimits ?? {}),
+      storageConfig: {
+        ...current.storageConfig,
+        ...(patch.storageConfig ?? {}),
+      },
+      adConfig: {
+        ...current.adConfig,
+        ...(patch.adConfig ?? {}),
       },
       rateLimits: {
         ...current.rateLimits,
@@ -1404,10 +1260,58 @@ export class AdminService {
         ...current.maintenanceExemptions,
         ...(patch.maintenanceExemptions ?? {}),
       },
+      synonymsConfig:
+        patch.synonymsConfig !== undefined
+          ? patch.synonymsConfig
+          : current.synonymsConfig,
       updatedAt: new Date().toISOString(),
     };
 
+    if (patch.similarityQuota) {
+      await this.database.query(
+        `INSERT INTO "SystemSettings" ("key", "value", "updatedAt")
+         VALUES ('similarityQuota', $1::jsonb, CURRENT_TIMESTAMP)
+         ON CONFLICT ("key") DO UPDATE SET "value" = $1::jsonb, "updatedAt" = CURRENT_TIMESTAMP`,
+        [JSON.stringify(updated.similarityQuota)],
+      );
+      this.similarityQueue?.updateConfig(updated.similarityQuota);
+    }
+
+    if (patch.storageConfig) {
+      await this.database.query(
+        `INSERT INTO "SystemSettings" ("key", "value", "updatedAt")
+         VALUES ('storageConfig', $1::jsonb, CURRENT_TIMESTAMP)
+         ON CONFLICT ("key") DO UPDATE SET "value" = $1::jsonb, "updatedAt" = CURRENT_TIMESTAMP`,
+        [JSON.stringify(updated.storageConfig)],
+      );
+    }
+
+    if (patch.adConfig) {
+      await this.database.query(
+        `INSERT INTO "SystemSettings" ("key", "value", "updatedAt")
+         VALUES ('adConfig', $1::jsonb, CURRENT_TIMESTAMP)
+         ON CONFLICT ("key") DO UPDATE SET "value" = $1::jsonb, "updatedAt" = CURRENT_TIMESTAMP`,
+        [JSON.stringify(updated.adConfig)],
+      );
+    }
+
+    if (patch.synonymsConfig !== undefined) {
+      await this.database.query(
+        `INSERT INTO "SystemSettings" ("key", "value", "updatedAt")
+         VALUES ('synonymsConfig', $1::jsonb, CURRENT_TIMESTAMP)
+         ON CONFLICT ("key") DO UPDATE SET "value" = $1::jsonb, "updatedAt" = CURRENT_TIMESTAMP`,
+        [JSON.stringify(updated.synonymsConfig)],
+      );
+    }
+
     await this.redis.set('system:settings', JSON.stringify(updated));
+    await this.redis.publish(
+      'system:settings:updated',
+      JSON.stringify({
+        type: 'system:settings:updated',
+        settings: updated,
+      }),
+    );
 
     await this.recordAuditEvent({
       actorId: actor?.userId,
@@ -1763,19 +1667,27 @@ export type MaintenanceExemptions = {
   exemptRoles?: string[];
 };
 
+export type SimilarityQuotaConfig = {
+  anonymousThroughputPerMinute: number;
+  registeredThroughputPerMinute: number;
+};
+
+export type StorageConfig = {
+  defaultStorageLimitMb: number;
+};
+
+export type AdConfig = {
+  effectiveEcpm: number;
+  canvasAdDensity: number;
+  maxCanvasAds: number;
+};
+
 export type SystemSettings = {
   retentionDays: number;
   retentionGraceDays: number;
-  freeTierLimits: {
-    maxNodes: number;
-    maxSourcesPerGraph: number;
-    maxSourceSizeBytes: number;
-  };
-  proTierLimits: {
-    maxNodes: number;
-    maxSourcesPerGraph: number;
-    maxSourceSizeBytes: number;
-  };
+  similarityQuota: SimilarityQuotaConfig;
+  storageConfig: StorageConfig;
+  adConfig: AdConfig;
   rateLimits: {
     anonymousPerMinute: number;
     authenticatedPerMinute: number;
@@ -1783,6 +1695,7 @@ export type SystemSettings = {
   };
   maintenanceMode: boolean;
   maintenanceExemptions?: MaintenanceExemptions;
+  synonymsConfig?: Record<string, string[]>;
   updatedAt: string;
 };
 
@@ -1833,15 +1746,17 @@ export type ArchiveAuditLogsDto = {
 export const DEFAULT_SYSTEM_SETTINGS: SystemSettings = {
   retentionDays: 90,
   retentionGraceDays: 7,
-  freeTierLimits: {
-    maxNodes: 100,
-    maxSourcesPerGraph: 5,
-    maxSourceSizeBytes: 26214400, // 25 MB
+  similarityQuota: {
+    anonymousThroughputPerMinute: 30,
+    registeredThroughputPerMinute: 120,
   },
-  proTierLimits: {
-    maxNodes: 5000,
-    maxSourcesPerGraph: 50,
-    maxSourceSizeBytes: 104857600, // 100 MB
+  storageConfig: {
+    defaultStorageLimitMb: 100,
+  },
+  adConfig: {
+    effectiveEcpm: 1.5,
+    canvasAdDensity: 35,
+    maxCanvasAds: 5,
   },
   rateLimits: {
     anonymousPerMinute: 30,
@@ -1853,6 +1768,23 @@ export const DEFAULT_SYSTEM_SETTINGS: SystemSettings = {
     allowedIps: ['127.0.0.1', '::1'],
     exemptUserIds: [],
     exemptRoles: ['admin'],
+  },
+  synonymsConfig: {
+    k8s: ['kubernetes'],
+    kubernetes: ['k8s'],
+    db: ['database'],
+    database: ['db'],
+    bfs: ['breadth-first search'],
+    dfs: ['depth-first search'],
+    mst: ['minimum spanning tree'],
+    api: ['application programming interface'],
+    ai: ['artificial intelligence'],
+    ml: ['machine learning'],
+    nlp: ['natural language processing'],
+    orm: ['object relational mapping'],
+    sql: ['structured query language'],
+    dag: ['directed acyclic graph'],
+    rag: ['retrieval-augmented generation'],
   },
   updatedAt: '2026-09-01T00:00:00.000Z',
 };

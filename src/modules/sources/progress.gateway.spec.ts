@@ -256,6 +256,7 @@ describe('ProgressGateway', () => {
     expect(mockSubscriber.subscribe).toHaveBeenCalledWith(
       'source:progress',
       'notification:new',
+      'crawl:progress',
     );
     expect(messageHandler).toBeDefined();
 
@@ -271,19 +272,61 @@ describe('ProgressGateway', () => {
 
     expect(mockServer.to).toHaveBeenCalledWith('graph:graph-456');
     expect(mockRoom.emit).toHaveBeenCalledWith('progress:update', incoming);
+  });
 
-    const incomingNotif = {
-      userId: 'user-999',
-      notification: { id: 'notif-99', title: 'Sweep Warning' },
+  it('forwards crawl:progress Redis message to graph room', async () => {
+    let messageHandler:
+      ((channel: string, message: string) => void) | undefined;
+    mockSubscriber.on.mockImplementation((event: string, handler: any) => {
+      if (event === 'message') {
+        messageHandler = handler;
+      }
+    });
+
+    await gateway.onModuleInit();
+
+    const crawlPayload = {
+      graphId: 'graph-789',
+      level: 1,
+      status: 'hop_evaluated',
+      message: 'Evaluated level 1',
+      matchesCount: 3,
+      currentNodes: [{ id: 'n1', level: 1 } as any],
+      currentEdges: [{ id: 'e1', level: 1 } as any],
     };
 
-    messageHandler!('notification:new', JSON.stringify(incomingNotif));
+    messageHandler!('crawl:progress', JSON.stringify(crawlPayload));
 
-    expect(mockServer.to).toHaveBeenCalledWith('user:user-999');
-    expect(mockRoom.emit).toHaveBeenCalledWith(
+    expect(mockServer.to).toHaveBeenCalledWith('graph:graph-789');
+    expect(mockRoom.emit).toHaveBeenCalledWith('crawl:progress', crawlPayload);
+  });
+
+  it('ignores invalid JSON in progress message', async () => {
+    let messageHandler:
+      ((channel: string, message: string) => void) | undefined;
+    mockSubscriber.on.mockImplementation((event: string, handler: any) => {
+      if (event === 'message') {
+        messageHandler = handler;
+      }
+    });
+
+    await gateway.onModuleInit();
+    messageHandler!('source:progress', 'not-json');
+
+    expect(mockServer.to).not.toHaveBeenCalled();
+    expect(mockRoom.emit).not.toHaveBeenCalled();
+  });
+
+  it('unsubscribes and quits Redis subscriber on module destroy', async () => {
+    await gateway.onModuleInit();
+    await gateway.onModuleDestroy();
+
+    expect(mockSubscriber.unsubscribe).toHaveBeenCalledWith(
+      'source:progress',
       'notification:new',
-      incomingNotif.notification,
+      'crawl:progress',
     );
+    expect(mockSubscriber.quit).toHaveBeenCalled();
   });
 
   it('ignores messages on other channels or with invalid JSON', async () => {
@@ -317,6 +360,7 @@ describe('ProgressGateway', () => {
     expect(mockSubscriber.unsubscribe).toHaveBeenCalledWith(
       'source:progress',
       'notification:new',
+      'crawl:progress',
     );
     expect(mockSubscriber.quit).toHaveBeenCalled();
   });

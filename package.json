@@ -18,8 +18,7 @@
     "format": "prettier --write \"src/**/*.ts\"",
     "test": "jest",
     "test:watch": "jest --watch",
-    "test:e2e": "jest --config test/jest-e2e.json",
-    "webhook:simulate": "ts-node-esm src/scripts/simulate-webhook.ts"
+    "test:e2e": "jest --config test/jest-e2e.json"
   },
   "dependencies": {
     "@casl/ability": "^6.7.3",

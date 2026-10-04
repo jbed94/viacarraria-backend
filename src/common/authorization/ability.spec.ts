@@ -10,9 +10,9 @@ const guest = {
   isGuest: true,
 };
 
-const freeUser = {
+const registeredUser = {
   userId: 'user-1',
-  tier: 'FREE' as const,
+  tier: 'REGISTERED' as const,
   email: 'user@example.com',
   username: 'User',
   isGuest: false,
@@ -44,7 +44,7 @@ describe('defineAbilityFor', () => {
   });
 
   it('allows registered users to manage only their own graphs and sources', () => {
-    const ability = defineAbilityFor(freeUser);
+    const ability = defineAbilityFor(registeredUser);
 
     expect(
       ability.can(

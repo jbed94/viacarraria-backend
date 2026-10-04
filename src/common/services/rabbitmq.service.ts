@@ -19,11 +19,29 @@ export type ParsingJob = {
   priority: number;
   retryCount?: number;
   maxRetries?: number;
+  storageKey?: string;
+  storageUrl?: string;
+};
+
+export type TagMatchingJob = {
+  jobId: string;
+  sourceId: string;
+  graphId: string;
+  sourceName: string;
+  sourceContent?: string;
+  vocabItems?: Array<{ term: string; weight: number }>;
+  priority?: number;
+  retryCount?: number;
+  maxRetries?: number;
 };
 
 export const PARSING_QUEUE = 'document_parsing_queue';
 export const PARSING_DLX = 'document_parsing_dlx';
 export const PARSING_DLQ = 'document_parsing_dlq';
+
+export const TAG_MATCHING_QUEUE = 'tag_matching_queue';
+export const TAG_MATCHING_DLX = 'tag_matching_dlx';
+export const TAG_MATCHING_DLQ = 'tag_matching_dlq';
 
 @Injectable()
 export class RabbitMqService implements OnModuleInit, OnModuleDestroy {
@@ -64,6 +82,25 @@ export class RabbitMqService implements OnModuleInit, OnModuleDestroy {
       persistent: true,
       priority: job.priority,
     });
+  }
+
+  async publishTagMatchingJob(job: TagMatchingJob): Promise<void> {
+    const channel = await this.ensureChannel();
+    const payload: TagMatchingJob = {
+      ...job,
+      priority: job.priority ?? 5,
+      retryCount: job.retryCount ?? 0,
+      maxRetries: job.maxRetries ?? 3,
+    };
+    channel.sendToQueue(
+      TAG_MATCHING_QUEUE,
+      Buffer.from(JSON.stringify(payload)),
+      {
+        contentType: 'application/json',
+        persistent: true,
+        priority: payload.priority,
+      },
+    );
   }
 
   async publishToDlq(
@@ -141,6 +178,44 @@ export class RabbitMqService implements OnModuleInit, OnModuleDestroy {
         await this.channel.assertQueue(PARSING_QUEUE, {
           durable: true,
           arguments: queueArgs,
+        });
+      } else {
+        throw err;
+      }
+    }
+
+    // 5. Assert Tag Matching Dead Letter Exchange and Queue
+    await this.channel.assertExchange(TAG_MATCHING_DLX, 'direct', {
+      durable: true,
+    });
+    await this.channel.assertQueue(TAG_MATCHING_DLQ, { durable: true });
+    await this.channel.bindQueue(
+      TAG_MATCHING_DLQ,
+      TAG_MATCHING_DLX,
+      TAG_MATCHING_DLQ,
+    );
+
+    const tagQueueArgs = {
+      'x-max-priority': 10,
+      'x-dead-letter-exchange': TAG_MATCHING_DLX,
+      'x-dead-letter-routing-key': TAG_MATCHING_DLQ,
+    };
+
+    try {
+      await this.channel.assertQueue(TAG_MATCHING_QUEUE, {
+        durable: true,
+        arguments: tagQueueArgs,
+      });
+    } catch (err: unknown) {
+      if (err instanceof Error && err.message.includes('PRECONDITION_FAILED')) {
+        this.logger.warn(
+          'Existing tag queue arguments differ; updating queue with DLX bindings...',
+        );
+        this.channel = await this.connection.createChannel();
+        await this.channel.deleteQueue(TAG_MATCHING_QUEUE);
+        await this.channel.assertQueue(TAG_MATCHING_QUEUE, {
+          durable: true,
+          arguments: tagQueueArgs,
         });
       } else {
         throw err;

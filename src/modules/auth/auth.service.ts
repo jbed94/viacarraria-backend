@@ -1,8 +1,7 @@
 import {
-  HttpException,
-  HttpStatus,
   Injectable,
   NotFoundException,
+  Optional,
   UnauthorizedException,
 } from '@nestjs/common';
 import { fromNodeHeaders } from 'better-auth/node';
@@ -13,9 +12,11 @@ import { RedisService } from '../../common/services/redis.service.js';
 import type {
   AuthenticatedRequest,
   LimitsSummary,
+  QueueOccupation,
   SubscriptionTier,
   ViewerIdentity,
 } from '../../common/types.js';
+import { PlansService } from '../plans/plans.service.js';
 import type { ChangePasswordDto, UpdateProfileDto } from './auth.dto.js';
 
 type AuthUser = {
@@ -25,6 +26,7 @@ type AuthUser = {
   username?: string | null;
   isAnonymous?: boolean | null;
   subscriptionTier?: string | null;
+  storageLimitMb?: number | null;
 };
 
 type IdentityRow = {
@@ -35,6 +37,7 @@ type IdentityRow = {
   isAnonymous: boolean;
   subscriptionTier: string | null;
   preferredLanguage: string;
+  storageLimitMb?: number | null;
 };
 
 @Injectable()
@@ -42,6 +45,7 @@ export class AuthService {
   constructor(
     private readonly database: DatabaseService,
     private readonly redis: RedisService,
+    @Optional() private readonly plans?: PlansService,
   ) {}
 
   async resolveIdentity(
@@ -57,17 +61,27 @@ export class AuthService {
     identity: ViewerIdentity,
   ): Promise<ViewerIdentity & { preferredLanguage: string }> {
     this.requireRegistered(identity);
-    const row = await this.database.one<IdentityRow>(
-      `SELECT "id", "email", "name", "username", "isAnonymous", "subscriptionTier", "preferredLanguage"
+    const user = await this.database.one<{
+      id: string;
+      email: string;
+      name: string;
+      username: string | null;
+      isAnonymous: boolean;
+      subscriptionTier: string | null;
+      preferredLanguage: string;
+      storageLimitMb?: number | null;
+    }>(
+      `SELECT "id", "email", "name", "username", "isAnonymous", "subscriptionTier",
+              "preferredLanguage", "storageLimitMb"
        FROM "User" WHERE "id" = $1`,
       [identity.userId],
     );
-    if (!row) {
+    if (!user) {
       throw new UnauthorizedException();
     }
     return {
-      ...this.toIdentity(row),
-      preferredLanguage: row.preferredLanguage,
+      ...this.toIdentity(user),
+      preferredLanguage: user.preferredLanguage,
     };
   }
 
@@ -83,7 +97,7 @@ export class AuthService {
     const [row] = await this.database.query<IdentityRow>(
       `UPDATE "User" SET "name" = $1, "username" = $1, "preferredLanguage" = $2, "updatedAt" = CURRENT_TIMESTAMP
        WHERE "id" = $3
-       RETURNING "id", "email", "name", "username", "isAnonymous", "subscriptionTier", "preferredLanguage"`,
+       RETURNING "id", "email", "name", "username", "isAnonymous", "subscriptionTier", "preferredLanguage", "storageLimitMb"`,
       [username, preferredLanguage, identity.userId],
     );
     if (!row) {
@@ -159,88 +173,125 @@ export class AuthService {
   }
 
   async consumeQueryQuota(
-    identity: ViewerIdentity,
-  ): Promise<{ remaining: number }> {
-    const limit =
-      identity.tier === 'ANONYMOUS' ? 3 : identity.tier === 'FREE' ? 20 : 1000;
-    const quota = await this.redis.consumeQuota(identity.userId, limit);
-    if (!quota.allowed) {
-      throw new HttpException(
-        'Daily query budget reached.',
-        HttpStatus.TOO_MANY_REQUESTS,
-      );
-    }
-    return { remaining: quota.remaining };
+    _identity: ViewerIdentity,
+    _options?: {
+      cost?: number;
+      selectedNodeCount?: number;
+      isCrawl?: boolean;
+      crawlSteps?: number;
+    },
+  ): Promise<{
+    remaining: number;
+    deducted?: number;
+    searchSpaceMultiplier?: number;
+  }> {
+    // Queries are free with no per-user hard blocking cap; global Weaviate throttling queue manages throughput
+    return {
+      remaining: 999999,
+      deducted: 0,
+      searchSpaceMultiplier: 1.0,
+    };
   }
 
   async limits(identity: ViewerIdentity | undefined): Promise<LimitsSummary> {
     const viewer = this.requireIdentity(identity);
-    const [graphRow, sourceRow, queryUsage, uploadUsage] = await Promise.all([
-      this.database.one<{ total: string; privateCount: string }>(
-        `SELECT 
-           COUNT(*)::text AS "total",
-           COUNT(*) FILTER (WHERE "isPublic" = false)::text AS "privateCount"
-         FROM "Graph" WHERE "userId" = $1`,
-        [viewer.userId],
-      ),
-      this.database.one<{ maxCount: string }>(
-        `SELECT COALESCE(MAX("sourceCount"), 0)::text AS "maxCount"
-         FROM (
-           SELECT COUNT(*) AS "sourceCount"
-           FROM "NodeSource" s JOIN "Graph" g ON g."id" = s."graphId"
-           WHERE g."userId" = $1 GROUP BY s."graphId", s."nodeId"
-         ) counts`,
-        [viewer.userId],
-      ),
-      this.redis.getDailyUsage(viewer.userId),
-      this.redis.getHourlyUploadUsage(viewer.userId),
-    ]);
+    const [graphRow, sourceRow, userStorageRow, settingsRow, userRow] =
+      await Promise.all([
+        this.database.one<{ total: string; privateCount: string }>(
+          `SELECT 
+             COUNT(*)::text AS "total",
+             COUNT(*) FILTER (WHERE "isPublic" = false)::text AS "privateCount"
+           FROM "Graph" WHERE "userId" = $1`,
+          [viewer.userId],
+        ),
+        this.database.one<{ maxCount: string }>(
+          `SELECT COALESCE(MAX("sourceCount"), 0)::text AS "maxCount"
+           FROM (
+             SELECT COUNT(*) AS "sourceCount"
+             FROM "NodeSource" s JOIN "Graph" g ON g."id" = s."graphId"
+             WHERE g."userId" = $1 GROUP BY s."graphId", s."nodeId"
+           ) counts`,
+          [viewer.userId],
+        ),
+        this.database.one<{ totalBytes: string }>(
+          `SELECT COALESCE(SUM(s."sizeBytes"), 0)::text as "totalBytes"
+           FROM "NodeSource" s
+           JOIN "Graph" g ON g."id" = s."graphId"
+           WHERE g."userId" = $1`,
+          [viewer.userId],
+        ),
+        this.database.one<{ value: any }>(
+          `SELECT "value" FROM "SystemSettings" WHERE "key" = 'storageConfig'`,
+        ),
+        this.database.one<{ storageLimitMb: number | null }>(
+          'SELECT "storageLimitMb" FROM "User" WHERE "id" = $1',
+          [viewer.userId],
+        ),
+      ]);
+
     const maxNodes = await this.database.one<{ maxCount: string }>(
       `SELECT COALESCE(MAX(jsonb_array_length("nodes")), 0)::text AS "maxCount"
        FROM "Graph" WHERE "userId" = $1`,
       [viewer.userId],
     );
-    const graphLimit = viewer.isGuest ? 0 : viewer.tier === 'FREE' ? 5 : 100;
-    const privateGraphLimit = viewer.isGuest
+
+    const usedBytes = Number(userStorageRow?.totalBytes || 0);
+    const globalDefaultMb = Number(
+      settingsRow?.value?.defaultStorageLimitMb ?? 100,
+    );
+    const limitMb = viewer.isGuest
       ? 0
-      : viewer.tier === 'FREE'
-        ? 2
-        : 100;
-    const queryLimit =
-      viewer.tier === 'ANONYMOUS' ? 3 : viewer.tier === 'FREE' ? 20 : 1000;
-    const uploadLimit = viewer.isGuest ? 0 : 10;
-    const nodeLimit = viewer.isGuest ? 0 : viewer.tier === 'FREE' ? 10 : null;
-    const sourceLimit = viewer.isGuest ? 0 : viewer.tier === 'FREE' ? 3 : null;
-    const fileSizeLimit = viewer.isGuest
-      ? 0
-      : viewer.tier === 'FREE'
-        ? 2 * 1024 * 1024
-        : 1024 * 1024 * 1024;
-    const extendedLimit =
-      viewer.tier === 'ANONYMOUS' ? 0 : viewer.tier === 'FREE' ? 3 : 15;
+      : (userRow?.storageLimitMb ?? globalDefaultMb);
+    const limitBytes = limitMb * 1024 * 1024;
+    const usedMb = Number((usedBytes / (1024 * 1024)).toFixed(2));
+
+    let queueOccupation: QueueOccupation = 'low';
+    if (this.redis) {
+      const stored = await this.redis.get('queue:similarity:occupation');
+      if (stored === 'low' || stored === 'mid' || stored === 'high') {
+        queueOccupation = stored;
+      }
+    }
+
     return {
       tier: viewer.tier,
-      graphs: this.limitStatus(Number(graphRow?.total ?? '0'), graphLimit),
+      storage: {
+        usedBytes,
+        limitBytes,
+        usedMb,
+        limitMb,
+        exceeded: limitBytes > 0 && usedBytes >= limitBytes,
+      },
+      queueOccupation,
+      canCreateGraphs: !viewer.isGuest && viewer.tier === 'REGISTERED',
+      crawl: {
+        allowedDepths: viewer.isGuest
+          ? ['shallow']
+          : ['shallow', 'default', 'deep'],
+        maxStartingPoints: viewer.isGuest ? 1 : 100,
+        comparativeModeAllowed: !viewer.isGuest,
+      },
+      graphs: this.limitStatus(
+        Number(graphRow?.total ?? '0'),
+        viewer.isGuest ? 0 : null,
+      ),
       privateGraphs: this.limitStatus(
         Number(graphRow?.privateCount ?? '0'),
-        privateGraphLimit,
+        viewer.isGuest ? 0 : null,
       ),
-      queries: this.limitStatus(queryUsage, queryLimit),
-      uploads: this.limitStatus(uploadUsage, uploadLimit),
-      selectedNodes: this.limitStatus(
-        0,
-        viewer.isGuest ? 2 : viewer.tier === 'FREE' ? 10 : null,
-      ),
-      nodesPerGraph: this.limitStatus(
-        Number(maxNodes?.maxCount ?? '0'),
-        nodeLimit,
-      ),
+      queries: this.limitStatus(0, null),
+      uploads: this.limitStatus(0, viewer.isGuest ? 0 : null),
+      selectedNodes: this.limitStatus(0, viewer.isGuest ? 2 : null),
+      nodesPerGraph: this.limitStatus(Number(maxNodes?.maxCount ?? '0'), null),
       sourcesPerNode: this.limitStatus(
         Number(sourceRow?.maxCount ?? '0'),
-        sourceLimit,
+        null,
       ),
-      sourceSizeBytes: this.limitStatus(0, fileSizeLimit),
-      extendedContext: this.limitStatus(0, extendedLimit),
+      sourceSizeBytes: this.limitStatus(
+        0,
+        viewer.isGuest ? 0 : 50 * 1024 * 1024,
+      ),
+      extendedContext: this.limitStatus(0, null),
     };
   }
 
@@ -275,20 +326,21 @@ export class AuthService {
         user.name === 'jbed94' ||
         user.username === 'jbed94');
 
-    return {
+    const identity: ViewerIdentity = {
       userId: user.id,
       email: user.email,
       username: user.username ?? user.name,
       isGuest,
       tier: isGuest ? 'ANONYMOUS' : this.toTier(user.subscriptionTier),
       role: isAdmin ? 'admin' : 'user',
+      storageLimitMb:
+        user.storageLimitMb !== undefined ? user.storageLimitMb : null,
     };
+    return identity;
   }
 
   private toTier(value: string | null | undefined): SubscriptionTier {
-    return value === 'PRO' || value === 'FREE' || value === 'ANONYMOUS'
-      ? value
-      : 'FREE';
+    return value === 'ANONYMOUS' ? 'ANONYMOUS' : 'REGISTERED';
   }
 
   private limitStatus(used: number, limit: number | null) {

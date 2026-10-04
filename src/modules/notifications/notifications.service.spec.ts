@@ -41,7 +41,7 @@ describe('NotificationsService', () => {
     email: 'user@example.com',
     username: 'user123',
     isGuest: false,
-    tier: 'PRO',
+    tier: 'REGISTERED',
   };
 
   const mockGuest: ViewerIdentity = {

@@ -12,12 +12,7 @@ jest.mock('../../auth.js', () => ({
   },
 }));
 
-import {
-  HttpException,
-  HttpStatus,
-  NotFoundException,
-  UnauthorizedException,
-} from '@nestjs/common';
+import { NotFoundException, UnauthorizedException } from '@nestjs/common';
 
 import { auth } from '../../auth.js';
 import type { DatabaseService } from '../../common/services/database.service.js';
@@ -41,20 +36,12 @@ describe('AuthService', () => {
     tier: 'ANONYMOUS',
   };
 
-  const freeIdentity: ViewerIdentity = {
-    userId: 'user-free-1',
-    email: 'free@example.com',
-    username: 'FreeUser',
+  const registeredIdentity: ViewerIdentity = {
+    userId: 'user-reg-1',
+    email: 'reg@example.com',
+    username: 'RegUser',
     isGuest: false,
-    tier: 'FREE',
-  };
-
-  const proIdentity: ViewerIdentity = {
-    userId: 'user-pro-1',
-    email: 'pro@example.com',
-    username: 'ProUser',
-    isGuest: false,
-    tier: 'PRO',
+    tier: 'REGISTERED',
   };
 
   beforeEach(() => {
@@ -64,6 +51,8 @@ describe('AuthService', () => {
     };
 
     mockRedis = {
+      get: jest.fn().mockResolvedValue('low'),
+      set: jest.fn().mockResolvedValue(undefined),
       consumeQuota: jest.fn(),
       getDailyUsage: jest.fn(),
       getHourlyUploadUsage: jest.fn(),
@@ -76,54 +65,22 @@ describe('AuthService', () => {
   });
 
   describe('consumeQueryQuota', () => {
-    it('enforces limit of 3 queries per day for ANONYMOUS users', async () => {
-      (mockRedis.consumeQuota as jest.Mock).mockResolvedValue({
-        allowed: true,
-        remaining: 2,
-      });
-
+    it('returns unblocked query quota for ANONYMOUS users', async () => {
       const result = await service.consumeQueryQuota(guestIdentity);
-
-      expect(mockRedis.consumeQuota).toHaveBeenCalledWith('guest-anon-1', 3);
-      expect(result).toEqual({ remaining: 2 });
+      expect(result).toEqual({
+        remaining: 999999,
+        deducted: 0,
+        searchSpaceMultiplier: 1.0,
+      });
     });
 
-    it('enforces limit of 20 queries per day for FREE users', async () => {
-      (mockRedis.consumeQuota as jest.Mock).mockResolvedValue({
-        allowed: true,
-        remaining: 15,
+    it('returns unblocked query quota for REGISTERED users', async () => {
+      const result = await service.consumeQueryQuota(registeredIdentity);
+      expect(result).toEqual({
+        remaining: 999999,
+        deducted: 0,
+        searchSpaceMultiplier: 1.0,
       });
-
-      const result = await service.consumeQueryQuota(freeIdentity);
-
-      expect(mockRedis.consumeQuota).toHaveBeenCalledWith('user-free-1', 20);
-      expect(result).toEqual({ remaining: 15 });
-    });
-
-    it('enforces limit of 1000 queries per day for PRO users', async () => {
-      (mockRedis.consumeQuota as jest.Mock).mockResolvedValue({
-        allowed: true,
-        remaining: 990,
-      });
-
-      const result = await service.consumeQueryQuota(proIdentity);
-
-      expect(mockRedis.consumeQuota).toHaveBeenCalledWith('user-pro-1', 1000);
-      expect(result).toEqual({ remaining: 990 });
-    });
-
-    it('throws HTTP 429 Too Many Requests when daily quota is exceeded', async () => {
-      (mockRedis.consumeQuota as jest.Mock).mockResolvedValue({
-        allowed: false,
-        remaining: 0,
-      });
-
-      await expect(service.consumeQueryQuota(freeIdentity)).rejects.toThrow(
-        new HttpException(
-          'Daily query budget reached.',
-          HttpStatus.TOO_MANY_REQUESTS,
-        ),
-      );
     });
   });
 
@@ -132,140 +89,81 @@ describe('AuthService', () => {
       (mockDatabase.one as jest.Mock)
         .mockResolvedValueOnce({ total: '0', privateCount: '0' })
         .mockResolvedValueOnce({ maxCount: '0' })
+        .mockResolvedValueOnce({ totalBytes: '0' })
+        .mockResolvedValueOnce({ value: { defaultStorageLimitMb: 100 } })
+        .mockResolvedValueOnce(null)
         .mockResolvedValueOnce({ maxCount: '0' });
-      (mockRedis.getDailyUsage as jest.Mock).mockResolvedValue(1);
-      (mockRedis.getHourlyUploadUsage as jest.Mock).mockResolvedValue(0);
+
+      (mockRedis.get as jest.Mock).mockResolvedValueOnce('low');
 
       const limits = await service.limits(guestIdentity);
 
       expect(limits.tier).toBe('ANONYMOUS');
-      expect(limits.graphs).toEqual({ used: 0, limit: 0, exceeded: true });
-      expect(limits.privateGraphs).toEqual({
-        used: 0,
-        limit: 0,
-        exceeded: true,
+      expect(limits.canCreateGraphs).toBe(false);
+      expect(limits.storage).toEqual({
+        usedBytes: 0,
+        limitBytes: 0,
+        usedMb: 0,
+        limitMb: 0,
+        exceeded: false,
       });
-      expect(limits.queries).toEqual({ used: 1, limit: 3, exceeded: false });
-      expect(limits.uploads).toEqual({ used: 0, limit: 0, exceeded: true });
+      expect(limits.queueOccupation).toBe('low');
+      expect(limits.crawl).toEqual({
+        allowedDepths: ['shallow'],
+        maxStartingPoints: 1,
+        comparativeModeAllowed: false,
+      });
+      expect(limits.graphs).toEqual({ used: 0, limit: 0, exceeded: true });
       expect(limits.selectedNodes).toEqual({
         used: 0,
         limit: 2,
         exceeded: false,
-      });
-      expect(limits.nodesPerGraph).toEqual({
-        used: 0,
-        limit: 0,
-        exceeded: true,
-      });
-      expect(limits.sourcesPerNode).toEqual({
-        used: 0,
-        limit: 0,
-        exceeded: true,
       });
       expect(limits.sourceSizeBytes).toEqual({
         used: 0,
         limit: 0,
         exceeded: true,
       });
-      expect(limits.extendedContext).toEqual({
-        used: 0,
-        limit: 0,
-        exceeded: true,
-      });
     });
 
-    it('returns Free tier quota limits with exceeded flags when caps are hit', async () => {
+    it('returns Registered tier limits with storage and graph creation unlocked', async () => {
       (mockDatabase.one as jest.Mock)
         .mockResolvedValueOnce({ total: '5', privateCount: '2' })
         .mockResolvedValueOnce({ maxCount: '3' })
+        .mockResolvedValueOnce({ totalBytes: `${50 * 1024 * 1024}` })
+        .mockResolvedValueOnce({ value: { defaultStorageLimitMb: 100 } })
+        .mockResolvedValueOnce({ storageLimitMb: 100 })
         .mockResolvedValueOnce({ maxCount: '10' });
-      (mockRedis.getDailyUsage as jest.Mock).mockResolvedValue(20);
-      (mockRedis.getHourlyUploadUsage as jest.Mock).mockResolvedValue(10);
 
-      const limits = await service.limits(freeIdentity);
+      (mockRedis.get as jest.Mock).mockResolvedValueOnce('mid');
 
-      expect(limits.tier).toBe('FREE');
-      expect(limits.graphs).toEqual({ used: 5, limit: 5, exceeded: true });
-      expect(limits.privateGraphs).toEqual({
-        used: 2,
-        limit: 2,
-        exceeded: true,
+      const limits = await service.limits(registeredIdentity);
+
+      expect(limits.tier).toBe('REGISTERED');
+      expect(limits.canCreateGraphs).toBe(true);
+      expect(limits.storage.usedMb).toBe(50);
+      expect(limits.storage.limitMb).toBe(100);
+      expect(limits.storage.exceeded).toBe(false);
+      expect(limits.queueOccupation).toBe('mid');
+      expect(limits.crawl).toEqual({
+        allowedDepths: ['shallow', 'default', 'deep'],
+        maxStartingPoints: 100,
+        comparativeModeAllowed: true,
       });
-      expect(limits.queries).toEqual({ used: 20, limit: 20, exceeded: true });
-      expect(limits.uploads).toEqual({ used: 10, limit: 10, exceeded: true });
+      expect(limits.graphs).toEqual({ used: 5, limit: null, exceeded: false });
       expect(limits.selectedNodes).toEqual({
         used: 0,
-        limit: 10,
+        limit: null,
         exceeded: false,
       });
       expect(limits.nodesPerGraph).toEqual({
         used: 10,
-        limit: 10,
-        exceeded: true,
-      });
-      expect(limits.sourcesPerNode).toEqual({
-        used: 3,
-        limit: 3,
-        exceeded: true,
-      });
-      expect(limits.sourceSizeBytes).toEqual({
-        used: 0,
-        limit: 2 * 1024 * 1024,
-        exceeded: false,
-      });
-      expect(limits.extendedContext).toEqual({
-        used: 0,
-        limit: 3,
-        exceeded: false,
-      });
-    });
-
-    it('returns Pro tier expanded limits without caps on nodes and sources', async () => {
-      (mockDatabase.one as jest.Mock)
-        .mockResolvedValueOnce({ total: '12', privateCount: '8' })
-        .mockResolvedValueOnce({ maxCount: '25' })
-        .mockResolvedValueOnce({ maxCount: '80' });
-      (mockRedis.getDailyUsage as jest.Mock).mockResolvedValue(45);
-      (mockRedis.getHourlyUploadUsage as jest.Mock).mockResolvedValue(2);
-
-      const limits = await service.limits(proIdentity);
-
-      expect(limits.tier).toBe('PRO');
-      expect(limits.graphs).toEqual({ used: 12, limit: 100, exceeded: false });
-      expect(limits.privateGraphs).toEqual({
-        used: 8,
-        limit: 100,
-        exceeded: false,
-      });
-      expect(limits.queries).toEqual({
-        used: 45,
-        limit: 1000,
-        exceeded: false,
-      });
-      expect(limits.uploads).toEqual({ used: 2, limit: 10, exceeded: false });
-      expect(limits.selectedNodes).toEqual({
-        used: 0,
-        limit: null,
-        exceeded: false,
-      });
-      expect(limits.nodesPerGraph).toEqual({
-        used: 80,
-        limit: null,
-        exceeded: false,
-      });
-      expect(limits.sourcesPerNode).toEqual({
-        used: 25,
         limit: null,
         exceeded: false,
       });
       expect(limits.sourceSizeBytes).toEqual({
         used: 0,
-        limit: 1024 * 1024 * 1024,
-        exceeded: false,
-      });
-      expect(limits.extendedContext).toEqual({
-        used: 0,
-        limit: 15,
+        limit: 50 * 1024 * 1024,
         exceeded: false,
       });
     });
@@ -274,25 +172,26 @@ describe('AuthService', () => {
   describe('profile & updateProfile', () => {
     it('returns user profile including preferred language', async () => {
       (mockDatabase.one as jest.Mock).mockResolvedValue({
-        id: 'user-free-1',
-        email: 'free@example.com',
-        name: 'Free User',
-        username: 'freeuser',
+        id: 'user-reg-1',
+        email: 'reg@example.com',
+        name: 'Registered User',
+        username: 'reguser',
         isAnonymous: false,
-        subscriptionTier: 'FREE',
+        subscriptionTier: 'REGISTERED',
         preferredLanguage: 'pl',
       });
 
-      const profile = await service.profile(freeIdentity);
+      const profile = await service.profile(registeredIdentity);
 
       expect(profile).toEqual({
-        userId: 'user-free-1',
-        email: 'free@example.com',
-        username: 'freeuser',
+        userId: 'user-reg-1',
+        email: 'reg@example.com',
+        username: 'reguser',
         isGuest: false,
-        tier: 'FREE',
+        tier: 'REGISTERED',
         role: 'user',
         preferredLanguage: 'pl',
+        storageLimitMb: null,
       });
     });
 
@@ -305,36 +204,35 @@ describe('AuthService', () => {
     it('throws UnauthorizedException if profile row is missing from DB', async () => {
       (mockDatabase.one as jest.Mock).mockResolvedValue(null);
 
-      await expect(service.profile(freeIdentity)).rejects.toThrow(
+      await expect(service.profile(registeredIdentity)).rejects.toThrow(
         UnauthorizedException,
       );
     });
 
     it('updates user username and normalized preferred language', async () => {
-      // Mock profile() call
       (mockDatabase.one as jest.Mock).mockResolvedValue({
-        id: 'user-free-1',
-        email: 'free@example.com',
-        name: 'Free User',
-        username: 'freeuser',
+        id: 'user-reg-1',
+        email: 'reg@example.com',
+        name: 'Reg User',
+        username: 'reguser',
         isAnonymous: false,
-        subscriptionTier: 'FREE',
+        subscriptionTier: 'REGISTERED',
         preferredLanguage: 'en',
       });
 
       (mockDatabase.query as jest.Mock).mockResolvedValue([
         {
-          id: 'user-free-1',
-          email: 'free@example.com',
+          id: 'user-reg-1',
+          email: 'reg@example.com',
           name: 'updated-name',
           username: 'updated-name',
           isAnonymous: false,
-          subscriptionTier: 'FREE',
+          subscriptionTier: 'REGISTERED',
           preferredLanguage: 'de',
         },
       ]);
 
-      const result = await service.updateProfile(freeIdentity, {
+      const result = await service.updateProfile(registeredIdentity, {
         username: '  updated-name  ',
         preferredLanguage: ' DE ',
       });
@@ -343,7 +241,7 @@ describe('AuthService', () => {
         expect.stringContaining(
           'UPDATE "User" SET "name" = $1, "username" = $1, "preferredLanguage" = $2',
         ),
-        ['updated-name', 'de', 'user-free-1'],
+        ['updated-name', 'de', 'user-reg-1'],
       );
       expect(result.username).toBe('updated-name');
       expect(result.preferredLanguage).toBe('de');
@@ -358,13 +256,13 @@ describe('AuthService', () => {
       ];
       (mockDatabase.query as jest.Mock).mockResolvedValue(mockSessions);
 
-      const result = await service.sessions(freeIdentity);
+      const result = await service.sessions(registeredIdentity);
 
       expect(mockDatabase.query).toHaveBeenCalledWith(
         expect.stringContaining(
           'SELECT "id", "expiresAt", "updatedAt" AS "lastUsedAt"',
         ),
-        ['user-free-1'],
+        ['user-reg-1'],
       );
       expect(result).toEqual(mockSessions);
     });
@@ -378,13 +276,13 @@ describe('AuthService', () => {
       });
 
       const dummyReq = { headers: {} } as AuthenticatedRequest;
-      await service.revokeSession(freeIdentity, dummyReq, 'sess-1');
+      await service.revokeSession(registeredIdentity, dummyReq, 'sess-1');
 
       expect(mockDatabase.one).toHaveBeenCalledWith(
         expect.stringContaining(
           'SELECT "token" FROM "Session" WHERE "id" = $1 AND "userId" = $2',
         ),
-        ['sess-1', 'user-free-1'],
+        ['sess-1', 'user-reg-1'],
       );
       expect(auth.api.revokeSession).toHaveBeenCalledWith(
         expect.objectContaining({ body: { token: 'sess-token-abc' } }),
@@ -396,7 +294,11 @@ describe('AuthService', () => {
 
       const dummyReq = { headers: {} } as AuthenticatedRequest;
       await expect(
-        service.revokeSession(freeIdentity, dummyReq, 'non-existent-sess'),
+        service.revokeSession(
+          registeredIdentity,
+          dummyReq,
+          'non-existent-sess',
+        ),
       ).rejects.toThrow(NotFoundException);
     });
   });
@@ -408,7 +310,7 @@ describe('AuthService', () => {
       });
       const dummyReq = { headers: {} } as AuthenticatedRequest;
 
-      await service.changePassword(freeIdentity, dummyReq, {
+      await service.changePassword(registeredIdentity, dummyReq, {
         currentPassword: 'oldPassword123',
         newPassword: 'newPassword456',
       });
@@ -431,7 +333,7 @@ describe('AuthService', () => {
       const dummyReq = { headers: {} } as AuthenticatedRequest;
 
       await expect(
-        service.changePassword(freeIdentity, dummyReq, {
+        service.changePassword(registeredIdentity, dummyReq, {
           currentPassword: 'wrongPassword',
           newPassword: 'newPassword456',
         }),
@@ -446,7 +348,7 @@ describe('AuthService', () => {
       });
       const dummyReq = { headers: {} } as AuthenticatedRequest;
 
-      await service.deleteProfile(freeIdentity, dummyReq);
+      await service.deleteProfile(registeredIdentity, dummyReq);
 
       expect(auth.api.deleteUser).toHaveBeenCalledWith(
         expect.objectContaining({ body: {} }),
@@ -468,7 +370,9 @@ describe('AuthService', () => {
     });
 
     it('requireRegistered accepts non-guest users', () => {
-      expect(service.requireRegistered(freeIdentity)).toEqual(freeIdentity);
+      expect(service.requireRegistered(registeredIdentity)).toEqual(
+        registeredIdentity,
+      );
     });
   });
 });

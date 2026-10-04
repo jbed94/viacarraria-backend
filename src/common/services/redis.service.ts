@@ -146,6 +146,29 @@ export class RedisService implements OnModuleInit, OnModuleDestroy {
     return local.value;
   }
 
+  async mget(keys: string[]): Promise<(string | null)[]> {
+    if (!keys || keys.length === 0) {
+      return [];
+    }
+    if (this.available) {
+      try {
+        return await this.client.mget(...keys);
+      } catch (error: unknown) {
+        this.available = false;
+        this.logger.warn(`Redis mget fallback: ${this.message(error)}`);
+      }
+    }
+    const now = Date.now();
+    return keys.map((key) => {
+      const local = this.localValues.get(key);
+      if (!local || local.expiresAt <= now) {
+        this.localValues.delete(key);
+        return null;
+      }
+      return local.value;
+    });
+  }
+
   async getDailyUsage(identifier: string): Promise<number> {
     const key = `usage:${identifier}:${new Date().toISOString().slice(0, 10)}`;
     return this.readCounter(key);
@@ -222,7 +245,15 @@ export class RedisService implements OnModuleInit, OnModuleDestroy {
     if (!this.available) {
       return null;
     }
-    return this.client.duplicate();
+    const subscriber = this.client.duplicate({
+      enableOfflineQueue: true,
+      maxRetriesPerRequest: null,
+      lazyConnect: true,
+    });
+    subscriber.on('error', (error: Error) => {
+      this.logger.warn(`Redis subscriber error: ${error.message}`);
+    });
+    return subscriber;
   }
 
   async publish(channel: string, message: string): Promise<number> {

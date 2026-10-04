@@ -5,7 +5,14 @@ import { existsSync } from 'fs';
 import { mkdir, readFile, readdir, rm, stat, writeFile } from 'fs/promises';
 import { basename, dirname, join } from 'path';
 import { Readable } from 'stream';
-import { createGzip, gunzipSync, gzipSync } from 'zlib';
+import {
+  brotliCompressSync,
+  brotliDecompressSync,
+  constants as zlibConstants,
+  createGzip,
+  gunzipSync,
+  gzipSync,
+} from 'zlib';
 
 export type StorageDriver = 's3' | 'local';
 
@@ -277,7 +284,7 @@ export class StorageService {
     return header;
   }
 
-  createTarGz(files: Array<{ name: string; buffer: Buffer }>): Buffer {
+  createTar(files: Array<{ name: string; buffer: Buffer }>): Buffer {
     const buffers: Buffer[] = [];
     for (const file of files) {
       buffers.push(this.createTarHeader(file.name, file.buffer.length));
@@ -286,8 +293,21 @@ export class StorageService {
       if (padding > 0) buffers.push(Buffer.alloc(padding, 0));
     }
     buffers.push(Buffer.alloc(1024, 0));
-    const tarBuf = Buffer.concat(buffers);
+    return Buffer.concat(buffers);
+  }
+
+  createTarGz(files: Array<{ name: string; buffer: Buffer }>): Buffer {
+    const tarBuf = this.createTar(files);
     return gzipSync(tarBuf, { level: 9 });
+  }
+
+  createTarBr(files: Array<{ name: string; buffer: Buffer }>): Buffer {
+    const tarBuf = this.createTar(files);
+    return brotliCompressSync(tarBuf, {
+      params: {
+        [zlibConstants.BROTLI_PARAM_QUALITY]: 11,
+      },
+    });
   }
 
   createTarGzStream(files: Array<{ name: string; buffer: Buffer }>): Readable {
@@ -310,8 +330,7 @@ export class StorageService {
     yield Buffer.alloc(1024, 0);
   }
 
-  extractTarGz(tarGzBuffer: Buffer): Array<{ name: string; buffer: Buffer }> {
-    const tarBuf = gunzipSync(tarGzBuffer);
+  extractTar(tarBuf: Buffer): Array<{ name: string; buffer: Buffer }> {
     const files: Array<{ name: string; buffer: Buffer }> = [];
     let offset = 0;
 
@@ -359,11 +378,45 @@ export class StorageService {
     return files;
   }
 
+  extractTarGz(tarGzBuffer: Buffer): Array<{ name: string; buffer: Buffer }> {
+    try {
+      const tarBuf = gunzipSync(tarGzBuffer);
+      return this.extractTar(tarBuf);
+    } catch (gzipErr) {
+      try {
+        const tarBuf = brotliDecompressSync(tarGzBuffer);
+        return this.extractTar(tarBuf);
+      } catch {
+        throw gzipErr;
+      }
+    }
+  }
+
+  extractTarBr(tarBrBuffer: Buffer): Array<{ name: string; buffer: Buffer }> {
+    const tarBuf = brotliDecompressSync(tarBrBuffer);
+    return this.extractTar(tarBuf);
+  }
+
+  extractArchive(
+    archiveBuffer: Buffer,
+  ): Array<{ name: string; buffer: Buffer }> {
+    if (archiveBuffer[0] === 0x1f && archiveBuffer[1] === 0x8b) {
+      return this.extractTarGz(archiveBuffer);
+    }
+    return this.extractTarBr(archiveBuffer);
+  }
+
   async archiveGraphData(
     graphId: string,
     manifest: Record<string, unknown>,
     sources: Array<{ filename: string; buffer: Buffer }>,
-  ): Promise<{ key: string; location: string; sizeBytes: number }> {
+    format: 'gzip' | 'brotli' = 'brotli',
+  ): Promise<{
+    key: string;
+    location: string;
+    sizeBytes: number;
+    format: 'gzip' | 'brotli';
+  }> {
     const filesToArchive: Array<{ name: string; buffer: Buffer }> = [
       {
         name: 'manifest.json',
@@ -375,19 +428,25 @@ export class StorageService {
       })),
     ];
 
-    const tarGzBuffer = this.createTarGz(filesToArchive);
-    const archiveKey = `archives/graphs/${graphId}.tar.gz`;
+    const isBrotli = format === 'brotli';
+    const compressedBuffer = isBrotli
+      ? this.createTarBr(filesToArchive)
+      : this.createTarGz(filesToArchive);
+    const ext = isBrotli ? 'tar.br' : 'tar.gz';
+    const contentType = isBrotli ? 'application/x-brotli' : 'application/gzip';
+    const archiveKey = `archives/graphs/${graphId}.${ext}`;
     const putResult = await this.putObject(
       archiveKey,
-      tarGzBuffer,
-      'application/gzip',
+      compressedBuffer,
+      contentType,
       'GLACIER',
     );
 
     return {
       key: archiveKey,
       location: putResult.location,
-      sizeBytes: tarGzBuffer.length,
+      sizeBytes: compressedBuffer.length,
+      format,
     };
   }
 
@@ -597,6 +656,13 @@ export class StorageService {
 
     // Local fallback: return relative API download link
     return Promise.resolve(`/api/sources/file/${sanitizedKey}`);
+  }
+
+  async getPresignedGetUrl(
+    key: string,
+    expiresInSeconds = 3600,
+  ): Promise<string> {
+    return this.getSignedUrl(key, expiresInSeconds);
   }
 
   async getPresignedPutUrl(

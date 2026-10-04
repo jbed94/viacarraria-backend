@@ -13,6 +13,7 @@ jest.mock('../../auth.js', () => ({
   },
 }));
 
+import { ForbiddenException } from '@nestjs/common';
 import { ConfigService } from '@nestjs/config';
 
 import { AuthorizationService } from '../../common/authorization/ability.js';
@@ -35,7 +36,7 @@ describe('GraphsService', () => {
 
   const freeUser: ViewerIdentity = {
     userId: 'user-free',
-    tier: 'FREE',
+    tier: 'REGISTERED',
     email: 'free@example.com',
     username: 'freeuser',
     isGuest: false,
@@ -43,7 +44,7 @@ describe('GraphsService', () => {
 
   const proUser: ViewerIdentity = {
     userId: 'user-pro',
-    tier: 'PRO',
+    tier: 'REGISTERED',
     email: 'pro@example.com',
     username: 'prouser',
     isGuest: false,
@@ -131,23 +132,10 @@ describe('GraphsService', () => {
       expect(result.isPublic).toBe(false);
     });
 
-    it('rejects creating a private graph if Free user already has 2 private graphs', async () => {
-      mockDb.one.mockResolvedValueOnce({ total: '2', privateCount: '2' });
-
-      await expect(
-        service.create(freeUser, {
-          title: 'Third Private Graph',
-          isPublic: false,
-        }),
-      ).rejects.toThrow(
-        'Free accounts can have up to two private graphs. Upgrade to Pro for unlimited private graphs.',
-      );
-    });
-
-    it('allows creating a public graph if Free user has 2 private graphs but under 5 total graphs', async () => {
+    it('allows creating a public graph for registered user', async () => {
       mockDb.one.mockImplementation((sql: string) => {
         if (sql.includes('COUNT(*)')) {
-          return Promise.resolve({ total: '2', privateCount: '2' });
+          return Promise.resolve({ total: '10', privateCount: '5' });
         }
         if (sql.includes('FROM "Graph" WHERE "id" = $1')) {
           return Promise.resolve({
@@ -167,7 +155,7 @@ describe('GraphsService', () => {
           return Promise.resolve({ count: '0' });
         }
         if (sql.includes('FROM "User"')) {
-          return Promise.resolve({ name: 'Free User' });
+          return Promise.resolve({ name: 'Registered User' });
         }
         return Promise.resolve(undefined);
       });
@@ -199,15 +187,26 @@ describe('GraphsService', () => {
       expect(result.isPublic).toBe(true);
     });
 
-    it('rejects creating any graph if Free user has reached 5 total graphs', async () => {
-      mockDb.one.mockResolvedValueOnce({ total: '5', privateCount: '1' });
+    it('rejects creating graphs for anonymous guests', async () => {
+      mockAuth.requireRegistered.mockImplementationOnce(() => {
+        throw new ForbiddenException(
+          'Anonymous guests cannot create or own graphs. Create a free registered account to build unlimited knowledge graphs.',
+        );
+      });
+      const guestViewer: ViewerIdentity = {
+        userId: 'guest-id',
+        tier: 'ANONYMOUS',
+        email: null,
+        username: null,
+        isGuest: true,
+      };
 
       await expect(
-        service.create(freeUser, {
-          title: 'Sixth Graph',
-          isPublic: true,
+        service.create(guestViewer, {
+          title: 'Guest Graph',
+          isPublic: false,
         }),
-      ).rejects.toThrow('Your plan supports up to 5 custom graphs.');
+      ).rejects.toThrow('Anonymous guests cannot create or own graphs');
     });
   });
 
@@ -280,35 +279,7 @@ describe('GraphsService', () => {
       expect(deleteAttachmentsCall?.[1]).toEqual(['graph-1']);
     });
 
-    it('rejects enabling retention exemption for Free users', async () => {
-      mockDb.one.mockImplementation((sql: string) => {
-        if (sql.includes('FROM "Graph" WHERE "id" = $1')) {
-          return Promise.resolve({
-            id: 'graph-1',
-            title: 'My Graph',
-            userId: freeUser.userId,
-            isPublic: false,
-            isPrepared: false,
-            isExemptFromRetention: false,
-            nodes: [],
-            edges: [],
-            createdAt: new Date(),
-            updatedAt: new Date(),
-          });
-        }
-        return Promise.resolve(undefined);
-      });
-
-      await expect(
-        service.updateSettings(freeUser, 'graph-1', {
-          isExemptFromRetention: true,
-        }),
-      ).rejects.toThrow(
-        'Preserving inactive graphs beyond 90 days requires a PRO subscription',
-      );
-    });
-
-    it('allows PRO users to enable retention exemption', async () => {
+    it('allows registered users to enable retention exemption', async () => {
       mockDb.one.mockImplementation((sql: string) => {
         if (sql.includes('FROM "Graph" WHERE "id" = $1')) {
           return Promise.resolve({
@@ -721,6 +692,111 @@ describe('GraphsService', () => {
       await expect(service.keepActive(freeUser, 'graph-404')).rejects.toThrow(
         'Graph not found.',
       );
+    });
+  });
+
+  describe('vocabulary cache invalidation', () => {
+    let mockRedis: { del: jest.Mock };
+    let serviceWithRedis: GraphsService;
+
+    beforeEach(() => {
+      mockRedis = {
+        del: jest.fn().mockResolvedValue(1),
+      };
+      const config = {
+        get: jest.fn().mockReturnValue('/tmp/uploads'),
+      } as unknown as ConfigService;
+
+      serviceWithRedis = new GraphsService(
+        mockDb as unknown as DatabaseService,
+        mockAuth as unknown as AuthService,
+        mockAuthorization,
+        config,
+        undefined,
+        undefined,
+        undefined,
+        mockRedis as any,
+      );
+    });
+
+    it('invalidates graph vocabulary cache when canvas is updated', async () => {
+      mockDb.one.mockResolvedValue({
+        id: 'graph-1',
+        title: 'Test Graph',
+        description: null,
+        userId: freeUser.userId,
+        isPublic: false,
+        isPrepared: false,
+        nodes: [{ id: 'node-1', label: 'Node 1' }],
+        edges: [],
+        createdAt: new Date(),
+        updatedAt: new Date(),
+      });
+      mockDb.query.mockImplementation((sql: string) => {
+        if (sql.includes('UPDATE "Graph" SET "nodes"')) {
+          return Promise.resolve([
+            {
+              id: 'graph-1',
+              title: 'Test Graph',
+              description: null,
+              userId: freeUser.userId,
+              isPublic: false,
+              isPrepared: false,
+              nodes: [{ id: 'node-1', label: 'Updated Node' }],
+              edges: [],
+              createdAt: new Date(),
+              updatedAt: new Date(),
+            },
+          ]);
+        }
+        return Promise.resolve([]);
+      });
+      jest
+        .spyOn(serviceWithRedis, 'get')
+        .mockResolvedValue({ id: 'graph-1' } as any);
+
+      await serviceWithRedis.update(freeUser, 'graph-1', {
+        nodes: [
+          {
+            id: 'node-1',
+            position: { x: 0, y: 0 },
+            data: { title: 'Updated Node' },
+          } as any,
+        ],
+        edges: [],
+      });
+
+      expect(mockRedis.del).toHaveBeenCalledWith('graph:graph-1:vocabulary');
+    });
+
+    it('invalidates graph and source vocabulary cache on graph deletion', async () => {
+      mockDb.one.mockResolvedValue({
+        id: 'graph-1',
+        title: 'Test Graph',
+        description: null,
+        userId: freeUser.userId,
+        isPublic: false,
+        isPrepared: false,
+        nodes: [],
+        edges: [],
+        createdAt: new Date(),
+        updatedAt: new Date(),
+      });
+      mockDb.query.mockImplementation((sql: string) => {
+        if (sql.includes('FROM "NodeSource" WHERE "graphId" = $1')) {
+          return Promise.resolve([
+            { id: 'src-1', fileUrl: 'seed://test' },
+            { id: 'src-2', fileUrl: 'seed://test2' },
+          ]);
+        }
+        return Promise.resolve([]);
+      });
+
+      await serviceWithRedis.delete(freeUser, 'graph-1');
+
+      expect(mockRedis.del).toHaveBeenCalledWith('graph:graph-1:vocabulary');
+      expect(mockRedis.del).toHaveBeenCalledWith('source:src-1:vocabulary');
+      expect(mockRedis.del).toHaveBeenCalledWith('source:src-2:vocabulary');
     });
   });
 });

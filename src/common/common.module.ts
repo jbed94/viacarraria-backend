@@ -6,6 +6,7 @@ import { EmbeddingService } from './services/embedding.service.js';
 import { RabbitMqService } from './services/rabbitmq.service.js';
 import { RedisService } from './services/redis.service.js';
 import { RerankService } from './services/rerank.service.js';
+import { SimilarityQueueService } from './services/similarity-queue.service.js';
 import { StorageService } from './services/storage.service.js';
 import { UpstashRateLimitService } from './services/upstash-rate-limit.service.js';
 import { WeaviateService } from './services/weaviate.service.js';
@@ -22,6 +23,7 @@ import { WeaviateService } from './services/weaviate.service.js';
     StorageService,
     WeaviateService,
     UpstashRateLimitService,
+    SimilarityQueueService,
   ],
   exports: [
     AuthorizationService,
@@ -33,6 +35,7 @@ import { WeaviateService } from './services/weaviate.service.js';
     StorageService,
     WeaviateService,
     UpstashRateLimitService,
+    SimilarityQueueService,
   ],
 })
 export class CommonModule {}

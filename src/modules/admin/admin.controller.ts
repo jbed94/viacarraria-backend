@@ -20,6 +20,13 @@ import { AdminGuard } from '../../common/guards/admin.guard.js';
 import { StorageService } from '../../common/services/storage.service.js';
 import type { AuthenticatedRequest } from '../../common/types.js';
 import { GraphRetentionService } from '../graphs/graph-retention.service.js';
+import { AdContextService } from '../plans/ad-context.service.js';
+import {
+  CreateAdContextTagDto,
+  UpdateAdContextTagDto,
+  UpdatePlanDto,
+} from '../plans/plans.dto.js';
+import { PlansService } from '../plans/plans.service.js';
 import { AdminService } from './admin.service.js';
 
 @Controller('admin')
@@ -29,6 +36,8 @@ export class AdminController {
     private readonly adminService: AdminService,
     private readonly retentionService: GraphRetentionService,
     private readonly storage: StorageService,
+    private readonly plansService: PlansService,
+    private readonly adContextService: AdContextService,
   ) {}
 
   // 1. Health & System Monitoring
@@ -70,12 +79,18 @@ export class AdminController {
     @Query('limit') limit?: string,
     @Query('search') search?: string,
     @Query('tier') tier?: string,
+    @Query('storageFilter')
+    storageFilter?: 'ALL' | 'HIGH_USAGE' | 'HAS_STORAGE',
+    @Query('activityFilter')
+    activityFilter?: 'ALL' | 'ACTIVE' | 'INACTIVE',
   ) {
     return this.adminService.getUsers({
       page: page ? Number.parseInt(page, 10) : undefined,
       limit: limit ? Number.parseInt(limit, 10) : undefined,
       search,
       tier,
+      storageFilter,
+      activityFilter,
     });
   }
 
@@ -85,12 +100,18 @@ export class AdminController {
     @Query('format') format?: 'csv' | 'json',
     @Query('search') search?: string,
     @Query('tier') tier?: string,
+    @Query('storageFilter')
+    storageFilter?: 'ALL' | 'HIGH_USAGE' | 'HAS_STORAGE',
+    @Query('activityFilter')
+    activityFilter?: 'ALL' | 'ACTIVE' | 'INACTIVE',
   ) {
     const exportFormat = format === 'json' ? 'json' : 'csv';
     const result = await this.adminService.exportUsers({
       format: exportFormat,
       search,
       tier,
+      storageFilter,
+      activityFilter,
     });
     const date = new Date().toISOString().split('T')[0];
     if (exportFormat === 'csv') {
@@ -139,12 +160,26 @@ export class AdminController {
       username?: string;
       subscriptionTier?: string;
       subscriptionExpiresAt?: string | null;
+      storageLimitMb?: number | null;
     },
     @Req() req?: AuthenticatedRequest,
   ) {
     return req?.identity
       ? this.adminService.updateUser(id, body, req.identity)
       : this.adminService.updateUser(id, body);
+  }
+
+  @Patch('users/:id/storage-limit')
+  async updateUserStorageLimit(
+    @Param('id') userId: string,
+    @Body('storageLimitMb') storageLimitMb: number | null,
+    @Req() req?: AuthenticatedRequest,
+  ) {
+    return this.adminService.updateUserStorageLimit(
+      userId,
+      storageLimitMb,
+      req?.identity,
+    );
   }
 
   @Delete('users/:id')
@@ -302,76 +337,142 @@ export class AdminController {
     return this.adminService.deleteArchive(graphId);
   }
 
-  // 6. Subscriptions & Billing
-  @Get('subscriptions/events')
-  async getSubscriptionEvents(
-    @Query('page') page?: string,
-    @Query('limit') limit?: string,
-  ) {
-    return this.adminService.getSubscriptionEvents({
-      page: page ? Number.parseInt(page, 10) : undefined,
-      limit: limit ? Number.parseInt(limit, 10) : undefined,
-    });
+  // 6. Plans & Tiers Configuration
+  @Get('plans')
+  async getPlans() {
+    return this.plansService.getPlanDefinitions();
   }
 
-  @Get('subscriptions/events/export')
-  async exportSubscriptionEvents(
-    @Res() res: Response,
-    @Query('format') format?: 'csv' | 'json',
+  @Get('plans/:tier')
+  async getPlan(@Param('tier') tier: string) {
+    return this.plansService.getPlanDefinition(tier);
+  }
+
+  @Patch('plans/:tier')
+  async updatePlan(
+    @Param('tier') tier: string,
+    @Body() body: UpdatePlanDto,
+    @Req() req?: AuthenticatedRequest,
   ) {
-    const exportFormat = format === 'json' ? 'json' : 'csv';
-    const result = await this.adminService.exportSubscriptionEvents({
-      format: exportFormat,
-    });
-    const date = new Date().toISOString().split('T')[0];
-    if (exportFormat === 'csv') {
-      res.setHeader('Content-Type', 'text/csv; charset=utf-8');
-      res.setHeader(
-        'Content-Disposition',
-        `attachment; filename="billing-events-${date}.csv"`,
-      );
-      return res.send(result);
+    const updated = await this.plansService.updatePlanDefinition(
+      tier,
+      body,
+      req?.identity,
+    );
+    if (typeof this.adminService.recordAuditEvent === 'function') {
+      await this.adminService.recordAuditEvent({
+        actorId: req?.identity?.userId ?? 'admin',
+        actorEmail: req?.identity?.email ?? undefined,
+        action: 'plans.update',
+        targetType: 'subscription',
+        targetId: tier,
+        details: { tier, version: updated.version, changes: body },
+      });
     }
-    res.setHeader('Content-Type', 'application/json; charset=utf-8');
+    return updated;
+  }
+
+  @Get('ads/analytics')
+  async getAdAnalytics(@Query('range') range?: string) {
+    return this.plansService.getAdAnalytics({ range: range as any });
+  }
+
+  @Get('ads/telemetry/export')
+  async exportAdTelemetry(
+    @Res() res: Response,
+    @Query('range') range?: string,
+  ) {
+    const csv = await this.plansService.exportAdTelemetryCsv(range as any);
+    const r = range || 'all';
+    res.setHeader('Content-Type', 'text/csv; charset=utf-8');
     res.setHeader(
       'Content-Disposition',
-      `attachment; filename="billing-events-${date}.json"`,
+      `attachment; filename="ad-telemetry-${r}-${new Date().toISOString().split('T')[0]}.csv"`,
     );
-    return res.json(result);
+    res.send(csv);
   }
 
-  @Post('subscriptions/grant')
-  async grantSubscription(
-    @Body()
-    body: {
-      userId: string;
-      tier?: 'PRO';
-      durationDays?: number;
-    },
+  @Post('ads/telemetry/rollup')
+  async triggerAdTelemetryRollup(
+    @Body() body?: { targetDate?: string },
     @Req() req?: AuthenticatedRequest,
   ) {
-    return req?.identity
-      ? this.adminService.grantSubscription(
-          body.userId,
-          body.tier,
-          body.durationDays,
-          req.identity,
-        )
-      : this.adminService.grantSubscription(
-          body.userId,
-          body.tier,
-          body.durationDays,
-        );
+    const result = await this.plansService.rollupAdTelemetryDaily(
+      body?.targetDate,
+    );
+    if (
+      req?.identity &&
+      typeof this.adminService.recordAuditEvent === 'function'
+    ) {
+      await this.adminService.recordAuditEvent({
+        actorId: req.identity.userId,
+        actorEmail: req.identity.email ?? undefined,
+        action: 'ad_telemetry_rollup',
+        targetType: 'system',
+        targetId: 'ad_telemetry',
+        details: { targetDate: body?.targetDate, ...result },
+      });
+    }
+    return result;
   }
 
-  @Post('subscriptions/revoke')
-  async revokeSubscription(
-    @Body() body: { userId: string },
+  @Post('ads/telemetry/purge')
+  async purgeOldAdTelemetry(
+    @Body() body?: { retentionDays?: number },
     @Req() req?: AuthenticatedRequest,
   ) {
-    return req?.identity
-      ? this.adminService.revokeSubscription(body.userId, req.identity)
-      : this.adminService.revokeSubscription(body.userId);
+    const result = await this.plansService.purgeOldAdTelemetryEvents(
+      body?.retentionDays,
+    );
+    if (
+      req?.identity &&
+      typeof this.adminService.recordAuditEvent === 'function'
+    ) {
+      await this.adminService.recordAuditEvent({
+        actorId: req.identity.userId,
+        actorEmail: req.identity.email ?? undefined,
+        action: 'ad_telemetry_purge',
+        targetType: 'system',
+        targetId: 'ad_telemetry',
+        details: { ...result },
+      });
+    }
+    return result;
+  }
+
+  @Get('ads/telemetry/status')
+  async getAdTelemetryStatus() {
+    return this.plansService.getAdTelemetryStatus();
+  }
+
+  // Contextual Ad Taxonomy & Tags
+  @Get('ads/tags')
+  async getAdTags(@Query('includeDisabled') includeDisabled?: string) {
+    const showAll = includeDisabled !== 'false';
+    return this.adContextService.getAllTags(showAll);
+  }
+
+  @Get('ads/tags/stats')
+  async getAdTagStats() {
+    return this.adContextService.getTagStats();
+  }
+
+  @Post('ads/tags')
+  async createAdTag(@Body() dto: CreateAdContextTagDto) {
+    return this.adContextService.createTag(dto);
+  }
+
+  @Put('ads/tags/:id')
+  async updateAdTag(
+    @Param('id') id: string,
+    @Body() dto: UpdateAdContextTagDto,
+  ) {
+    return this.adContextService.updateTag(id, dto);
+  }
+
+  @Delete('ads/tags/:id')
+  async deleteAdTag(@Param('id') id: string) {
+    return this.adContextService.deleteTag(id);
   }
 
   // 7. Admin Session Verification

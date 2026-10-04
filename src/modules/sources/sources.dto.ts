@@ -139,6 +139,49 @@ export class UpdateSourceStatusDto {
   progress?: number;
 }
 
+export class CreateNoteDto {
+  @IsString()
+  @MaxLength(100)
+  graphId!: string;
+
+  @IsString()
+  @MaxLength(100)
+  nodeId!: string;
+
+  @IsString()
+  @MaxLength(255)
+  title!: string;
+
+  @IsString()
+  content!: string;
+}
+
+export class UpdateSourceDto {
+  @IsOptional()
+  @IsString()
+  @MaxLength(255)
+  name?: string;
+
+  @IsOptional()
+  @IsString()
+  content?: string;
+}
+
+export class SourceAdTagMatchDto {
+  @IsString()
+  tagId!: string;
+
+  @IsNumber()
+  score!: number;
+}
+
+export class SetSourceAdTagsDto {
+  @IsArray()
+  @ValidateNested({ each: true })
+  @Type(() => SourceAdTagMatchDto)
+  matches!: SourceAdTagMatchDto[];
+}
+
 export type UploadedDocument = {
   originalname: string;
   mimetype: string;

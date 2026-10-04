@@ -1,9 +1,11 @@
 import {
+  BadRequestException,
   ForbiddenException,
   HttpException,
   HttpStatus,
   Injectable,
   NotFoundException,
+  Optional,
   UnsupportedMediaTypeException,
 } from '@nestjs/common';
 import { ConfigService } from '@nestjs/config';
@@ -23,11 +25,16 @@ import { GraphsService, type SourceSummary } from '../graphs/graphs.service.js';
 import type {
   AbortUploadDto,
   CompleteUploadDto,
+  CreateNoteDto,
   PresignedUploadDto,
+  SetSourceAdTagsDto,
+  UpdateSourceDto,
   UpdateSourceStatusDto,
   UploadedDocument,
   UploadSourceDto,
 } from './sources.dto.js';
+import { extractVocabularyFromSource } from '../search/vocabulary.utils.js';
+import { AdContextService } from '../plans/ad-context.service.js';
 import { ProgressGateway } from './progress.gateway.js';
 
 type SourceRecord = SourceSummary & {
@@ -51,6 +58,7 @@ export class SourcesService {
     private readonly authorization: AuthorizationService,
     private readonly progressGateway: ProgressGateway,
     config: ConfigService,
+    @Optional() private readonly adContextService?: AdContextService,
   ) {
     this.uploadDirectory =
       config.get<string>('UPLOAD_DIR') ?? join(process.cwd(), 'uploads');
@@ -92,34 +100,52 @@ export class SourcesService {
         'Choose a PDF, Markdown, or text file to upload.',
       );
     }
-    const uploadQuota = await this.redis.consumeUploadQuota(viewer.userId);
+    const uploadLimit = 50;
+    const uploadQuota = await this.redis.consumeUploadQuota(
+      viewer.userId,
+      uploadLimit,
+    );
     if (!uploadQuota.allowed) {
       throw new HttpException(
-        'Upload limit reached. Try again next hour.',
+        'Hourly upload limit reached (50/hour). Please try again in the next hour.',
         HttpStatus.TOO_MANY_REQUESTS,
       );
     }
     const fileType = this.fileType(file);
-    const maxBytes =
-      viewer.tier === 'FREE' ? 2 * 1024 * 1024 : 25 * 1024 * 1024;
-    if (file.size > maxBytes) {
+    const maxSingleFileBytes = 50 * 1024 * 1024; // 50 MB single file cap
+    if (file.size > maxSingleFileBytes) {
+      throw new ForbiddenException('Single file size is limited to 50 MB.');
+    }
+
+    // Check user's total source storage limit (default 100 MB or custom admin limit)
+    const userStorage = await this.database.one<{ totalBytes: string }>(
+      `SELECT COALESCE(SUM(s."sizeBytes"), 0)::text as "totalBytes"
+       FROM "NodeSource" s
+       JOIN "Graph" g ON g."id" = s."graphId"
+       WHERE g."userId" = $1`,
+      [viewer.userId],
+    );
+    const currentUsedBytes = Number(userStorage?.totalBytes || 0);
+
+    const settingsRow = await this.database.one<{ value: any }>(
+      `SELECT "value" FROM "SystemSettings" WHERE "key" = 'storageConfig'`,
+    );
+    const globalDefaultMb = Number(
+      settingsRow?.value?.defaultStorageLimitMb ?? 100,
+    );
+
+    const userRow = await this.database.one<{ storageLimitMb: number | null }>(
+      'SELECT "storageLimitMb" FROM "User" WHERE "id" = $1',
+      [viewer.userId],
+    );
+    const limitMb = userRow?.storageLimitMb ?? globalDefaultMb;
+    const limitBytes = limitMb * 1024 * 1024;
+
+    if (currentUsedBytes + file.size > limitBytes) {
+      const usedMbStr = (currentUsedBytes / (1024 * 1024)).toFixed(1);
       throw new ForbiddenException(
-        `Files are limited to ${maxBytes / 1024 / 1024} MB for your plan.`,
+        `Storage quota exceeded. You are using ${usedMbStr} MB of your ${limitMb} MB limit. Delete existing sources or contact administrator for more space.`,
       );
-    }
-    if (viewer.tier === 'FREE' && fileType === 'application/pdf') {
-      throw new ForbiddenException('PDF uploads require a Pro subscription.');
-    }
-    if (viewer.tier === 'FREE') {
-      const count = await this.database.one<{ count: string }>(
-        'SELECT COUNT(*)::text AS "count" FROM "NodeSource" WHERE "graphId" = $1 AND "nodeId" = $2',
-        [graph.id, dto.nodeId],
-      );
-      if (Number(count?.count ?? '0') >= 3) {
-        throw new ForbiddenException(
-          'Free graphs allow three source documents per node.',
-        );
-      }
     }
 
     const fileHash = createHash('sha256').update(file.buffer).digest('hex');
@@ -177,6 +203,12 @@ export class SourcesService {
         status: 'PENDING',
         progress: 0,
       });
+      let storageUrl: string | undefined;
+      if (stored.storageDriver === 's3' || this.storage.getDriver() === 's3') {
+        storageUrl = await this.storage
+          .getPresignedGetUrl(storageKey, 7200)
+          .catch(() => undefined);
+      }
       await this.rabbitMq.publishParsingJob({
         jobId,
         sourceId,
@@ -185,7 +217,9 @@ export class SourcesService {
         filePath: fileUrl,
         fileName: source?.name ?? file.originalname,
         fileHash,
-        priority: viewer.tier === 'PRO' ? 10 : 1,
+        priority: 5,
+        storageKey,
+        storageUrl,
       });
     } catch (error: unknown) {
       await this.database.query('DELETE FROM "NodeSource" WHERE "id" = $1', [
@@ -231,33 +265,42 @@ export class SourcesService {
         'The selected node does not exist in this graph.',
       );
     }
-    const uploadQuota = await this.redis.consumeUploadQuota(viewer.userId);
+    const usedBytesRow = await this.database.one<{ totalBytes: string }>(
+      `SELECT COALESCE(SUM(s."sizeBytes"), 0)::text AS "totalBytes"
+       FROM "NodeSource" s
+       JOIN "Graph" g ON g."id" = s."graphId"
+       WHERE g."userId" = $1`,
+      [viewer.userId],
+    );
+    const usedBytes = Number(usedBytesRow?.totalBytes ?? '0');
+    let limitMb: number = viewer.storageLimitMb ?? 100;
+    if (viewer.storageLimitMb === undefined || viewer.storageLimitMb === null) {
+      const setting = await this.database.one<{ value: any }>(
+        `SELECT "value" FROM "SystemSettings" WHERE "key" = 'storageConfig'`,
+      );
+      limitMb = setting?.value?.defaultStorageLimitMb ?? 100;
+    }
+    const maxAllowedBytes = limitMb * 1024 * 1024;
+    if (usedBytes + dto.fileSize > maxAllowedBytes) {
+      throw new ForbiddenException(
+        `Storage quota exceeded. Your current storage limit is ${limitMb} MB. Please delete unused sources or request a storage limit increase.`,
+      );
+    }
+
+    const uploadLimit = 50;
+    const uploadQuota = await this.redis.consumeUploadQuota(
+      viewer.userId,
+      uploadLimit,
+    );
     if (!uploadQuota.allowed) {
       throw new HttpException(
-        'Upload limit reached. Try again next hour.',
+        'Hourly upload limit reached (50/hour). Please try again in the next hour.',
         HttpStatus.TOO_MANY_REQUESTS,
       );
     }
-    const maxBytes =
-      viewer.tier === 'FREE' ? 2 * 1024 * 1024 : 1024 * 1024 * 1024;
+    const maxBytes = 50 * 1024 * 1024;
     if (dto.fileSize > maxBytes) {
-      throw new ForbiddenException(
-        `Files are limited to ${maxBytes / 1024 / 1024} MB for your plan.`,
-      );
-    }
-    if (viewer.tier === 'FREE' && dto.fileType === 'application/pdf') {
-      throw new ForbiddenException('PDF uploads require a Pro subscription.');
-    }
-    if (viewer.tier === 'FREE') {
-      const count = await this.database.one<{ count: string }>(
-        'SELECT COUNT(*)::text AS "count" FROM "NodeSource" WHERE "graphId" = $1 AND "nodeId" = $2',
-        [graph.id, dto.nodeId],
-      );
-      if (Number(count?.count ?? '0') >= 3) {
-        throw new ForbiddenException(
-          'Free graphs allow three source documents per node.',
-        );
-      }
+      throw new ForbiddenException('Files are limited to 50 MB.');
     }
 
     const sourceId = randomUUID();
@@ -323,6 +366,7 @@ export class SourcesService {
     let fileHash = dto.checksumSha256?.toLowerCase();
     let content: string | null = null;
     const finalSize = head.contentLength || dto.fileSize;
+
     const isSmallFile = (head.contentLength ?? 0) <= 2 * 1024 * 1024;
     const isTextFile = dto.fileType.startsWith('text/');
 
@@ -390,6 +434,12 @@ export class SourcesService {
         status: 'PENDING',
         progress: 0,
       });
+      let storageUrl: string | undefined;
+      if (this.storage.getDriver() === 's3') {
+        storageUrl = await this.storage
+          .getPresignedGetUrl(dto.storageKey, 7200)
+          .catch(() => undefined);
+      }
       await this.rabbitMq.publishParsingJob({
         jobId: dto.jobId,
         sourceId: dto.sourceId,
@@ -398,7 +448,9 @@ export class SourcesService {
         filePath: fileUrl,
         fileName: source?.name ?? dto.fileName,
         fileHash,
-        priority: viewer.tier === 'PRO' ? 10 : 1,
+        priority: 5,
+        storageKey: dto.storageKey,
+        storageUrl,
       });
     } catch (error: unknown) {
       await this.database.query('DELETE FROM "NodeSource" WHERE "id" = $1', [
@@ -616,6 +668,251 @@ export class SourcesService {
     };
   }
 
+  async createNote(
+    identity: ViewerIdentity | undefined,
+    dto: CreateNoteDto,
+  ): Promise<SourceRecord> {
+    const viewer = this.auth.requireRegistered(
+      this.auth.requireIdentity(identity),
+    );
+    const graph = await this.graphs.findEditable(viewer, dto.graphId);
+    this.authorization.assertCan(viewer, 'upload', 'Source', {
+      graphUserId: graph.userId,
+      graphIsPublic: graph.isPublic,
+    });
+    if (!graph.nodes.some((node) => node.id === dto.nodeId)) {
+      throw new NotFoundException(
+        'The selected node does not exist in this graph.',
+      );
+    }
+
+    const noteContent = dto.content ?? '';
+    const noteBuffer = Buffer.from(noteContent, 'utf8');
+    const sizeBytes = noteBuffer.length;
+
+    const userStorage = await this.database.one<{ totalBytes: string }>(
+      `SELECT COALESCE(SUM(s."sizeBytes"), 0)::text as "totalBytes"
+       FROM "NodeSource" s
+       JOIN "Graph" g ON g."id" = s."graphId"
+       WHERE g."userId" = $1`,
+      [viewer.userId],
+    );
+    const currentUsedBytes = Number(userStorage?.totalBytes || 0);
+
+    const settingsRow = await this.database.one<{ value: any }>(
+      `SELECT "value" FROM "SystemSettings" WHERE "key" = 'storageConfig'`,
+    );
+    const globalDefaultMb = Number(
+      settingsRow?.value?.defaultStorageLimitMb ?? 100,
+    );
+    const userRow = await this.database.one<{ storageLimitMb: number | null }>(
+      'SELECT "storageLimitMb" FROM "User" WHERE "id" = $1',
+      [viewer.userId],
+    );
+    const limitMb = userRow?.storageLimitMb ?? globalDefaultMb;
+    const limitBytes = limitMb * 1024 * 1024;
+
+    if (currentUsedBytes + sizeBytes > limitBytes) {
+      const usedMbStr = (currentUsedBytes / (1024 * 1024)).toFixed(1);
+      throw new ForbiddenException(
+        `Storage quota exceeded. You are using ${usedMbStr} MB of your ${limitMb} MB limit.`,
+      );
+    }
+
+    const fileHash = createHash('sha256').update(noteBuffer).digest('hex');
+    const sourceId = randomUUID();
+    const jobId = randomUUID();
+    const rawTitle = dto.title.trim() || 'Untitled Note';
+    const fileName = rawTitle.endsWith('.md') ? rawTitle : `${rawTitle}.md`;
+    const storageKey = `sources/${graph.id}/${sourceId}/${fileName}`;
+
+    const stored = await this.storage.putObject(
+      storageKey,
+      noteBuffer,
+      'text/markdown',
+    );
+    const fileUrl = stored.location;
+    if (stored.storageDriver === 's3') {
+      void this.storage
+        .putObjectTagging(storageKey, {
+          Tier: viewer.tier,
+          GraphId: graph.id,
+          SourceId: sourceId,
+        })
+        .catch(() => undefined);
+    }
+
+    let source: SourceRecord | undefined;
+    try {
+      [source] = await this.database.query<SourceRecord>(
+        `INSERT INTO "NodeSource" (
+           "id", "nodeId", "graphId", "name", "fileType", "fileUrl", "fileHash", "sizeBytes", "status", "jobId", "content", "updatedAt"
+         ) VALUES ($1, $2, $3, $4, 'text/markdown', $5, $6, $7, 'READY', $8, $9, CURRENT_TIMESTAMP)
+         RETURNING "id", "nodeId", "graphId", "name", "fileType", "fileUrl", "sizeBytes", "status", "jobId", "content", "error", "createdAt", "updatedAt"`,
+        [
+          sourceId,
+          dto.nodeId,
+          graph.id,
+          fileName,
+          fileUrl,
+          fileHash,
+          sizeBytes,
+          jobId,
+          noteContent,
+        ],
+      );
+      await this.redis.set(`JOB_${jobId}:PROGRESS`, '100', 3600);
+      void this.redis.del(`graph:${graph.id}:vocabulary`).catch(() => {});
+      const vocabItems = extractVocabularyFromSource({
+        id: sourceId,
+        nodeId: dto.nodeId,
+        name: fileName,
+        content: noteContent,
+      });
+      if (vocabItems.length > 0) {
+        void this.redis
+          .set(
+            `source:${sourceId}:vocabulary`,
+            JSON.stringify(vocabItems),
+            604800,
+          )
+          .catch(() => {});
+      }
+      void this.dispatchTagMatching(
+        sourceId,
+        graph.id,
+        fileName,
+        noteContent,
+        vocabItems,
+        5,
+      ).catch(() => {});
+      this.progressGateway.emitUpdate({
+        sourceId,
+        graphId: graph.id,
+        nodeId: dto.nodeId,
+        status: 'READY',
+        progress: 100,
+      });
+
+      let storageUrl: string | undefined;
+      if (stored.storageDriver === 's3' || this.storage.getDriver() === 's3') {
+        storageUrl = await this.storage
+          .getPresignedGetUrl(storageKey, 7200)
+          .catch(() => undefined);
+      }
+      await this.rabbitMq.publishParsingJob({
+        jobId,
+        sourceId,
+        graphId: graph.id,
+        nodeId: dto.nodeId,
+        filePath: fileUrl,
+        fileName,
+        fileHash,
+        priority: 5,
+        storageKey,
+        storageUrl,
+      });
+    } catch (error: unknown) {
+      await this.database.query('DELETE FROM "NodeSource" WHERE "id" = $1', [
+        sourceId,
+      ]);
+      await this.storage.deleteObject(storageKey);
+      throw error;
+    }
+
+    if (!source) {
+      throw new NotFoundException('Note could not be created.');
+    }
+    return source;
+  }
+
+  async update(
+    identity: ViewerIdentity | undefined,
+    sourceId: string,
+    dto: UpdateSourceDto,
+  ): Promise<SourceRecord> {
+    const viewer = this.auth.requireRegistered(
+      this.auth.requireIdentity(identity),
+    );
+    const existing = await this.get(identity, sourceId);
+    const graph = await this.graphs.findEditable(viewer, existing.graphId);
+    this.authorization.assertCan(viewer, 'upload', 'Source', {
+      graphUserId: graph.userId,
+      graphIsPublic: graph.isPublic,
+    });
+
+    const newContent =
+      dto.content !== undefined ? dto.content : (existing.content ?? '');
+    const newName =
+      dto.name !== undefined && dto.name.trim()
+        ? dto.name.trim()
+        : existing.name;
+    const noteBuffer = Buffer.from(newContent, 'utf8');
+    const sizeBytes = noteBuffer.length;
+    const fileHash = createHash('sha256').update(noteBuffer).digest('hex');
+    const jobId = randomUUID();
+
+    let storageKey = `sources/${graph.id}/${existing.id}/${existing.id}.md`;
+    if (!existing.fileUrl.startsWith('seed://')) {
+      const match = existing.fileUrl.match(/sources\/[^/]+\/[^/]+\/[^/]+/);
+      if (match) {
+        storageKey = match[0];
+      }
+    }
+
+    await this.storage.putObject(storageKey, noteBuffer, 'text/markdown');
+
+    const [updated] = await this.database.query<SourceRecord>(
+      `UPDATE "NodeSource"
+       SET "name" = $1, "content" = $2, "sizeBytes" = $3, "fileHash" = $4, "jobId" = $5, "updatedAt" = CURRENT_TIMESTAMP
+       WHERE "id" = $6
+       RETURNING "id", "nodeId", "graphId", "name", "fileType", "fileUrl", "sizeBytes", "status", "jobId", "content", "error", "createdAt", "updatedAt"`,
+      [newName, newContent, sizeBytes, fileHash, jobId, sourceId],
+    );
+
+    if (!updated) {
+      throw new NotFoundException('Source could not be updated.');
+    }
+
+    void this.redis.del(`graph:${existing.graphId}:vocabulary`).catch(() => {});
+    void this.redis.del(`source:${existing.id}:vocabulary`).catch(() => {});
+    if (this.adContextService) {
+      void this.adContextService
+        .invalidateGraphContext(existing.graphId)
+        .catch(() => {});
+    }
+
+    let storageUrl: string | undefined;
+    if (this.storage.getDriver() === 's3') {
+      storageUrl = await this.storage
+        .getPresignedGetUrl(storageKey, 7200)
+        .catch(() => undefined);
+    }
+
+    await this.rabbitMq.publishParsingJob({
+      jobId,
+      sourceId: existing.id,
+      graphId: existing.graphId,
+      nodeId: existing.nodeId,
+      filePath: updated.fileUrl,
+      fileName: newName,
+      fileHash,
+      priority: 5,
+      storageKey,
+      storageUrl,
+    });
+
+    this.progressGateway.emitUpdate({
+      sourceId: existing.id,
+      graphId: existing.graphId,
+      nodeId: existing.nodeId,
+      status: updated.status,
+      progress: 100,
+    });
+
+    return updated;
+  }
+
   async delete(
     identity: ViewerIdentity | undefined,
     sourceId: string,
@@ -627,6 +924,14 @@ export class SourcesService {
     ]);
     if (!source.fileUrl.startsWith('seed://')) {
       await this.storage.deleteObject(source.fileUrl);
+    }
+    void this.redis.del(`graph:${source.graphId}:vocabulary`).catch(() => {});
+    void this.redis.del(`source:${source.id}:vocabulary`).catch(() => {});
+    if (this.adContextService) {
+      void this.adContextService
+        .invalidateGraphContext(source.graphId)
+        .catch(() => {});
+      void this.adContextService.recalculateMatchCounts().catch(() => {});
     }
   }
 
@@ -658,6 +963,40 @@ export class SourcesService {
         3600,
       );
     }
+    if (source.status === 'READY') {
+      void this.redis.del(`graph:${source.graphId}:vocabulary`).catch(() => {});
+      const vocabItems = extractVocabularyFromSource({
+        id: source.id,
+        nodeId: source.nodeId,
+        name: source.name,
+        content: source.content,
+      });
+      if (vocabItems.length > 0) {
+        void this.redis
+          .set(
+            `source:${source.id}:vocabulary`,
+            JSON.stringify(vocabItems),
+            604800,
+          )
+          .catch(() => {});
+      }
+      void this.dispatchTagMatching(
+        source.id,
+        source.graphId,
+        source.name,
+        source.content,
+        vocabItems,
+        5,
+      ).catch(() => {});
+    } else if (source.status === 'ERROR') {
+      void this.redis.del(`graph:${source.graphId}:vocabulary`).catch(() => {});
+      void this.redis.del(`source:${source.id}:vocabulary`).catch(() => {});
+      if (this.adContextService) {
+        void this.adContextService
+          .invalidateGraphContext(source.graphId)
+          .catch(() => {});
+      }
+    }
     this.progressGateway.emitUpdate({
       sourceId: source.id,
       graphId: source.graphId,
@@ -668,9 +1007,7 @@ export class SourcesService {
     return source;
   }
 
-  private fileType(
-    file: UploadedDocument,
-  ): 'application/pdf' | 'text/markdown' | 'text/plain' {
+  private fileType(file: UploadedDocument): string {
     const extension = extname(file.originalname).toLowerCase();
     if (file.mimetype === 'application/pdf' || extension === '.pdf') {
       if (!file.buffer.subarray(0, 5).equals(Buffer.from('%PDF-'))) {
@@ -686,6 +1023,52 @@ export class SourcesService {
     ) {
       return 'text/markdown';
     }
+    if (
+      file.mimetype === 'text/html' ||
+      ['.html', '.htm'].includes(extension)
+    ) {
+      return 'text/html';
+    }
+    if (
+      file.mimetype ===
+        'application/vnd.openxmlformats-officedocument.wordprocessingml.document' ||
+      extension === '.docx'
+    ) {
+      return 'application/vnd.openxmlformats-officedocument.wordprocessingml.document';
+    }
+    if (
+      file.mimetype ===
+        'application/vnd.openxmlformats-officedocument.presentationml.presentation' ||
+      extension === '.pptx'
+    ) {
+      return 'application/vnd.openxmlformats-officedocument.presentationml.presentation';
+    }
+    if (
+      file.mimetype ===
+        'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet' ||
+      extension === '.xlsx'
+    ) {
+      return 'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet';
+    }
+    if (
+      file.mimetype === 'text/asciidoc' ||
+      ['.adoc', '.asciidoc'].includes(extension)
+    ) {
+      return 'text/asciidoc';
+    }
+    if (
+      file.mimetype === 'application/rtf' ||
+      file.mimetype === 'text/rtf' ||
+      extension === '.rtf'
+    ) {
+      return 'application/rtf';
+    }
+    if (
+      file.mimetype === 'application/vnd.oasis.opendocument.text' ||
+      extension === '.odt'
+    ) {
+      return 'application/vnd.oasis.opendocument.text';
+    }
     if (file.mimetype.startsWith('text/') || extension === '.txt') {
       if (file.buffer.includes(0)) {
         throw new UnsupportedMediaTypeException(
@@ -695,16 +1078,34 @@ export class SourcesService {
       return 'text/plain';
     }
     throw new UnsupportedMediaTypeException(
-      'Only PDF, Markdown, and text files are supported.',
+      'Unsupported document format. Supported types: PDF, Markdown, Text, Word (docx), PowerPoint (pptx), Excel (xlsx), HTML.',
     );
   }
 
   private extensionFor(fileType: string): string {
-    return fileType === 'application/pdf'
-      ? '.pdf'
-      : fileType === 'text/markdown'
-        ? '.md'
-        : '.txt';
+    switch (fileType) {
+      case 'application/pdf':
+        return '.pdf';
+      case 'text/markdown':
+        return '.md';
+      case 'text/html':
+        return '.html';
+      case 'application/vnd.openxmlformats-officedocument.wordprocessingml.document':
+        return '.docx';
+      case 'application/vnd.openxmlformats-officedocument.presentationml.presentation':
+        return '.pptx';
+      case 'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet':
+        return '.xlsx';
+      case 'text/asciidoc':
+        return '.adoc';
+      case 'application/rtf':
+      case 'text/rtf':
+        return '.rtf';
+      case 'application/vnd.oasis.opendocument.text':
+        return '.odt';
+      default:
+        return '.txt';
+    }
   }
 
   private generateSeedPdf(title: string, description: string): Buffer {
@@ -832,5 +1233,115 @@ export class SourcesService {
       .replace(/\(/g, '\\(')
       .replace(/\)/g, '\\)')
       .replace(/[^\x20-\x7E]/g, ' ');
+  }
+
+  async uploadAsset(
+    token: string | undefined,
+    sourceId: string,
+    assetName: string,
+    buffer: Buffer,
+    contentType: string,
+  ): Promise<{ assetId: string; url: string; sizeBytes: number }> {
+    if (!this.isValidInternalToken(token)) {
+      throw new ForbiddenException('Invalid internal service token.');
+    }
+    const source = await this.database.one<SourceRecord>(
+      'SELECT "id", "graphId" FROM "NodeSource" WHERE "id" = $1',
+      [sourceId],
+    );
+    if (!source) {
+      throw new NotFoundException('Source not found.');
+    }
+    const cleanName = basename(assetName).replace(/[^a-zA-Z0-9._-]/g, '_');
+    const storageKey = `assets/${sourceId}/${cleanName}`;
+    await this.storage.putObject(storageKey, buffer, contentType);
+    return {
+      assetId: cleanName,
+      url: `/api/sources/${sourceId}/assets/${cleanName}`,
+      sizeBytes: buffer.length,
+    };
+  }
+
+  async getAsset(
+    sourceId: string,
+    assetName: string,
+    token?: string,
+    identity?: ViewerIdentity,
+  ): Promise<{
+    buffer: Buffer;
+    contentType: string;
+    contentLength: number;
+    status: number;
+  }> {
+    const cleanName = basename(assetName).replace(/[^a-zA-Z0-9._-]/g, '_');
+    const storageKey = `assets/${sourceId}/${cleanName}`;
+    try {
+      const result = await this.storage.getObject(storageKey);
+      return result;
+    } catch {
+      throw new NotFoundException('Source asset not found.');
+    }
+  }
+
+  async setAdTagsFromWorker(
+    token: string | undefined,
+    sourceId: string,
+    dto: SetSourceAdTagsDto,
+  ): Promise<{ success: boolean; count: number }> {
+    if (!this.isValidInternalToken(token)) {
+      throw new ForbiddenException('Invalid internal service token.');
+    }
+    const [source] = await this.database.query<{ id: string; graphId: string }>(
+      `SELECT "id", "graphId" FROM "NodeSource" WHERE "id" = $1`,
+      [sourceId],
+    );
+    if (!source) {
+      throw new NotFoundException('Source not found.');
+    }
+    if (this.adContextService) {
+      await this.adContextService.setSourceAdTags(
+        sourceId,
+        source.graphId,
+        dto.matches,
+      );
+    }
+    return { success: true, count: dto.matches.length };
+  }
+
+  private async dispatchTagMatching(
+    sourceId: string,
+    graphId: string,
+    sourceName: string,
+    sourceContent?: string | null,
+    vocabItems?: Array<{ term: string; weight: number }>,
+    priority = 5,
+  ): Promise<void> {
+    try {
+      const isAvailable = await this.rabbitMq.isAvailable();
+      if (isAvailable) {
+        await this.rabbitMq.publishTagMatchingJob({
+          jobId: randomUUID(),
+          sourceId,
+          graphId,
+          sourceName,
+          sourceContent: sourceContent ?? undefined,
+          vocabItems,
+          priority,
+        });
+        return;
+      }
+    } catch {
+      // RabbitMQ unavailable, fallback below
+    }
+
+    if (this.adContextService) {
+      await this.adContextService.matchSourceWithTags(
+        sourceId,
+        graphId,
+        sourceName,
+        sourceContent ?? undefined,
+        vocabItems,
+      );
+    }
   }
 }

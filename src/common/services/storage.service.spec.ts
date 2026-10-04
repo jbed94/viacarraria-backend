@@ -110,6 +110,13 @@ describe('StorageService', () => {
       expect(presignedUrl).toContain('X-Amz-Credential=minioadmin');
       expect(presignedUrl).toContain('X-Amz-Expires=1800');
       expect(presignedUrl).toContain('X-Amz-Signature=');
+
+      const presignedGetUrl = await storage.getPresignedGetUrl(
+        'sources/graph-1/doc.pdf',
+        3600,
+      );
+      expect(presignedGetUrl).toContain('X-Amz-Expires=3600');
+      expect(presignedGetUrl).toContain('X-Amz-Signature=');
     });
 
     it('should generate valid AWS SigV4 presigned PUT URLs for direct uploads', async () => {
@@ -523,20 +530,48 @@ describe('StorageService', () => {
       expect(extractedStream[0]?.name).toBe('manifest.json');
       expect(extractedStream[1]?.name).toBe('sources/doc1.txt');
 
-      // 3. archiveGraphData test
-      const archiveResult = await storage.archiveGraphData(
-        'graph-abc',
-        { title: 'Graph ABC' },
+      // 3. Brotli createTarBr and extractTarBr round-trip
+      const tarBr = storage.createTarBr(files);
+      expect(tarBr.length).toBeGreaterThan(0);
+      const extractedBr = storage.extractTarBr(tarBr);
+      expect(extractedBr).toHaveLength(3);
+      expect(extractedBr[0]?.name).toBe('manifest.json');
+      expect(extractedBr[1]?.name).toBe('sources/doc1.txt');
+      expect(extractedBr[2]?.name).toBe('sources/empty.txt');
+
+      // 4. Auto-detecting extractArchive with both Gzip and Brotli
+      expect(storage.extractArchive(tarGz)).toHaveLength(3);
+      expect(storage.extractArchive(tarBr)).toHaveLength(3);
+
+      // 5. archiveGraphData with Brotli (default)
+      const archiveResultBr = await storage.archiveGraphData(
+        'graph-brotli',
+        { title: 'Graph Brotli' },
         [{ filename: 'source1.pdf', buffer: Buffer.from('pdf data') }],
       );
-      expect(archiveResult.key).toBe('archives/graphs/graph-abc.tar.gz');
-      expect(archiveResult.sizeBytes).toBeGreaterThan(0);
+      expect(archiveResultBr.key).toBe('archives/graphs/graph-brotli.tar.br');
+      expect(archiveResultBr.format).toBe('brotli');
+      expect(archiveResultBr.sizeBytes).toBeGreaterThan(0);
 
-      const retrieved = await storage.getObject(archiveResult.key);
-      const unpacked = storage.extractTarGz(retrieved.buffer);
-      expect(unpacked).toHaveLength(2);
-      expect(unpacked[0]?.name).toBe('manifest.json');
-      expect(unpacked[1]?.name).toBe('sources/source1.pdf');
+      const retrievedBr = await storage.getObject(archiveResultBr.key);
+      const unpackedBr = storage.extractArchive(retrievedBr.buffer);
+      expect(unpackedBr).toHaveLength(2);
+      expect(unpackedBr[0]?.name).toBe('manifest.json');
+      expect(unpackedBr[1]?.name).toBe('sources/source1.pdf');
+
+      // 6. archiveGraphData with Gzip
+      const archiveResultGz = await storage.archiveGraphData(
+        'graph-gzip',
+        { title: 'Graph Gzip' },
+        [{ filename: 'source1.pdf', buffer: Buffer.from('pdf data') }],
+        'gzip',
+      );
+      expect(archiveResultGz.key).toBe('archives/graphs/graph-gzip.tar.gz');
+      expect(archiveResultGz.format).toBe('gzip');
+
+      const retrievedGz = await storage.getObject(archiveResultGz.key);
+      const unpackedGz = storage.extractTarGz(retrievedGz.buffer);
+      expect(unpackedGz).toHaveLength(2);
     });
   });
 

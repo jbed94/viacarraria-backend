@@ -1,3 +1,11 @@
+jest.mock('better-auth', () => ({ betterAuth: jest.fn() }));
+jest.mock('better-auth/plugins', () => ({ anonymous: jest.fn() }));
+jest.mock('better-auth/node', () => ({ fromNodeHeaders: jest.fn() }));
+jest.mock('../../auth.js', () => ({
+  auth: { api: {} },
+  authDatabase: { query: jest.fn() },
+}));
+
 import { ConfigService } from '@nestjs/config';
 import { WeaviateService } from './weaviate.service.js';
 import type { SearchChunk } from '../types.js';
@@ -276,5 +284,110 @@ describe('WeaviateService - Batch Ingestion', () => {
     expect(results).toHaveLength(1);
     expect(results[0]?.nodeId).toBe('adjacent-node');
     expect((results[0] as { vector?: unknown }).vector).toBeUndefined();
+  });
+
+  it('performs multiVectorSearch in a single batched GraphQL query with aliases', async () => {
+    mockFetch.mockImplementation((url: string, init?: RequestInit) => {
+      const urlStr = url.toString();
+      if (urlStr.includes('/v1/schema/Chunk')) {
+        return Promise.resolve({
+          ok: true,
+          status: 200,
+          json: () => Promise.resolve({ properties: [{ name: 'pageNum' }] }),
+        });
+      }
+      if (urlStr.includes('/v1/graphql')) {
+        const body = JSON.parse(init?.body as string) as { query: string };
+        expect(body.query).toContain('b_0: Chunk(');
+        expect(body.query).toContain('b_1: Chunk(');
+        return Promise.resolve({
+          ok: true,
+          status: 200,
+          json: () =>
+            Promise.resolve({
+              data: {
+                Get: {
+                  b_0: [
+                    {
+                      graphId: 'graph-test',
+                      sourceId: 'src-1',
+                      sourceName: 'Doc1.pdf',
+                      nodeId: 'node-A',
+                      content: 'Branch 0 content for node A',
+                      context: 'Context A',
+                      startChar: 0,
+                      endChar: 25,
+                      pageNum: 1,
+                      _additional: { score: '0.95', vector: [0.1, 0.2] },
+                    },
+                  ],
+                  b_1: [
+                    {
+                      graphId: 'graph-test',
+                      sourceId: 'src-2',
+                      sourceName: 'Doc2.pdf',
+                      nodeId: 'node-B',
+                      content: 'Branch 1 content for node B',
+                      context: 'Context B',
+                      startChar: 0,
+                      endChar: 25,
+                      pageNum: 2,
+                      _additional: { score: '0.85', vector: [0.3, 0.4] },
+                    },
+                  ],
+                },
+              },
+            }),
+        });
+      }
+      return Promise.resolve({ ok: true, status: 200 });
+    });
+
+    const resultMap = await service.multiVectorSearch('graph-test', [
+      {
+        id: 'branch-alpha',
+        vector: [0.1, 0.2],
+        adjacentNodeIds: ['node-A'],
+        limit: 5,
+      },
+      {
+        id: 'branch-beta',
+        vector: [0.3, 0.4],
+        adjacentNodeIds: ['node-B'],
+        limit: 5,
+      },
+    ]);
+
+    expect(resultMap.size).toBe(2);
+    const hitsAlpha = resultMap.get('branch-alpha');
+    const hitsBeta = resultMap.get('branch-beta');
+
+    expect(hitsAlpha).toBeDefined();
+    expect(hitsAlpha).toHaveLength(1);
+    expect(hitsAlpha![0]?.content).toBe('Branch 0 content for node A');
+    expect(hitsAlpha![0]?.score).toBe(0.95);
+    expect(hitsAlpha![0]?.vector).toEqual([0.1, 0.2]);
+
+    expect(hitsBeta).toBeDefined();
+    expect(hitsBeta).toHaveLength(1);
+    expect(hitsBeta![0]?.content).toBe('Branch 1 content for node B');
+    expect(hitsBeta![0]?.score).toBe(0.85);
+  });
+
+  it('handles empty or invalid queries gracefully in multiVectorSearch', async () => {
+    const emptyMap = await service.multiVectorSearch('graph-test', []);
+    expect(emptyMap.size).toBe(0);
+
+    const invalidMap = await service.multiVectorSearch('graph-test', [
+      {
+        id: 'empty-nodes',
+        vector: [0.1, 0.2],
+        adjacentNodeIds: [],
+        limit: 5,
+      },
+    ]);
+    expect(invalidMap.size).toBe(1);
+    expect(invalidMap.get('empty-nodes')).toEqual([]);
+    expect(mockFetch).not.toHaveBeenCalled();
   });
 });

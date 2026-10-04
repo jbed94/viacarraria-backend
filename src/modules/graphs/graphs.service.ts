@@ -2,6 +2,7 @@ import {
   ForbiddenException,
   Injectable,
   NotFoundException,
+  Optional,
   StreamableFile,
 } from '@nestjs/common';
 import { ConfigService } from '@nestjs/config';
@@ -14,6 +15,7 @@ import { extname, join } from 'path';
 import { validateCanvas } from '../../common/canvas.js';
 import { AuthorizationService } from '../../common/authorization/ability.js';
 import { DatabaseService } from '../../common/services/database.service.js';
+import { RedisService } from '../../common/services/redis.service.js';
 import { StorageService } from '../../common/services/storage.service.js';
 import { WeaviateService } from '../../common/services/weaviate.service.js';
 import type {
@@ -100,6 +102,7 @@ export class GraphsService {
     private readonly storage?: StorageService,
     private readonly weaviate?: WeaviateService,
     private readonly retentionService?: GraphRetentionService,
+    @Optional() private readonly redis?: RedisService,
   ) {
     this.uploadDirectory =
       config.get<string>('UPLOAD_DIR') ?? join(process.cwd(), 'uploads');
@@ -236,11 +239,6 @@ export class GraphsService {
     );
     const sourceGraph = await this.findAccessible(viewer, graphId);
     this.authorization.assertCan(viewer, 'copy', 'Graph', sourceGraph);
-    if (viewer.tier === 'FREE' && sourceGraph.nodes.length > 10) {
-      throw new ForbiddenException(
-        'Free accounts can copy graphs with up to ten nodes. Upgrade to Pro to copy this graph.',
-      );
-    }
     const isPublic = dto.isPublic === true;
     await this.assertGraphQuota(viewer, isPublic);
 
@@ -327,9 +325,6 @@ export class GraphsService {
     );
     const graph = await this.findEditable(viewer, graphId);
     const canvas = validateCanvas(dto.nodes, dto.edges);
-    if (viewer.tier === 'FREE' && canvas.nodes.length > 10) {
-      throw new ForbiddenException('Free graphs are limited to ten nodes.');
-    }
     const [updated] = await this.database.query<GraphRecord>(
       `UPDATE "Graph" SET "nodes" = $1::jsonb, "edges" = $2::jsonb, "isPrepared" = false, "updatedAt" = CURRENT_TIMESTAMP
        WHERE "id" = $3
@@ -343,6 +338,9 @@ export class GraphsService {
       'DELETE FROM "NodeSource" WHERE "graphId" = $1 AND NOT ("nodeId" = ANY($2::text[]))',
       [graph.id, canvas.nodes.map((node) => node.id)],
     );
+    if (this.redis) {
+      void this.redis.del(`graph:${graph.id}:vocabulary`).catch(() => {});
+    }
     return this.get(viewer, graph.id);
   }
 
@@ -378,17 +376,6 @@ export class GraphsService {
     let nextIsPublic = graph.isPublic;
     if (dto.isPublic !== undefined && dto.isPublic !== graph.isPublic) {
       if (!dto.isPublic) {
-        if (viewer.tier === 'FREE') {
-          const row = await this.database.one<{ privateCount: string }>(
-            'SELECT COUNT(*) FILTER (WHERE "isPublic" = false)::text AS "privateCount" FROM "Graph" WHERE "userId" = $1',
-            [viewer.userId],
-          );
-          if (Number(row?.privateCount ?? '0') >= 2) {
-            throw new ForbiddenException(
-              'Free accounts can have up to two private graphs. Upgrade to Pro for unlimited private graphs.',
-            );
-          }
-        }
         await this.database.query(
           'DELETE FROM "GraphAttachment" WHERE "graphId" = $1',
           [graph.id],
@@ -408,11 +395,6 @@ export class GraphsService {
       dto.isExemptFromRetention !== undefined &&
       dto.isExemptFromRetention !== isExemptFromRetention
     ) {
-      if (dto.isExemptFromRetention && viewer.tier !== 'PRO') {
-        throw new ForbiddenException(
-          'Preserving inactive graphs beyond 90 days requires a PRO subscription. Upgrade to Pro to enable lifetime graph retention.',
-        );
-      }
       isExemptFromRetention = dto.isExemptFromRetention;
     }
 
@@ -497,8 +479,8 @@ export class GraphsService {
     graphId: string,
   ): Promise<void> {
     const graph = await this.findEditable(identity, graphId);
-    const sources = await this.database.query<{ fileUrl: string }>(
-      'SELECT "fileUrl" FROM "NodeSource" WHERE "graphId" = $1',
+    const sources = await this.database.query<{ id: string; fileUrl: string }>(
+      'SELECT "id", "fileUrl" FROM "NodeSource" WHERE "graphId" = $1',
       [graph.id],
     );
     await this.database.query(
@@ -508,6 +490,16 @@ export class GraphsService {
     await this.database.query('DELETE FROM "Graph" WHERE "id" = $1', [
       graph.id,
     ]);
+
+    if (this.redis) {
+      void this.redis.del(`graph:${graph.id}:vocabulary`).catch(() => {});
+      void this.redis.del(`graph:${graph.id}:ad-context`).catch(() => {});
+      for (const s of sources) {
+        if (s.id) {
+          void this.redis.del(`source:${s.id}:vocabulary`).catch(() => {});
+        }
+      }
+    }
 
     if (this.storage) {
       for (const s of sources) {
@@ -556,29 +548,11 @@ export class GraphsService {
 
   private async assertGraphQuota(
     viewer: ViewerIdentity,
-    isPublic: boolean,
+    _isPublic: boolean,
   ): Promise<void> {
-    const row = await this.database.one<{
-      total: string;
-      privateCount: string;
-    }>(
-      `SELECT 
-         COUNT(*)::text AS "total",
-         COUNT(*) FILTER (WHERE "isPublic" = false)::text AS "privateCount"
-       FROM "Graph" WHERE "userId" = $1`,
-      [viewer.userId],
-    );
-    const total = Number(row?.total ?? '0');
-    const privateCount = Number(row?.privateCount ?? '0');
-    const maxTotal = viewer.tier === 'FREE' ? 5 : 100;
-    if (total >= maxTotal) {
+    if (viewer.isGuest || viewer.tier === 'ANONYMOUS') {
       throw new ForbiddenException(
-        `Your plan supports up to ${maxTotal} custom graphs.`,
-      );
-    }
-    if (!isPublic && viewer.tier === 'FREE' && privateCount >= 2) {
-      throw new ForbiddenException(
-        'Free accounts can have up to two private graphs. Upgrade to Pro for unlimited private graphs.',
+        'Anonymous guests cannot create or own graphs. Create a free registered account to build unlimited knowledge graphs.',
       );
     }
   }
