@@ -31,13 +31,19 @@ const googleProvider =
       }
     : undefined;
 
+const rawAuthUrl = process.env.BETTER_AUTH_URL ?? 'http://localhost:3000';
+const cleanBaseUrl = rawAuthUrl.replace(/\/api(\/auth)?\/?$/, '');
+
 export const auth = betterAuth({
-  baseURL: process.env.BETTER_AUTH_URL ?? 'http://localhost:3000',
+  baseURL: cleanBaseUrl,
   basePath: '/api/auth',
   secret: betterAuthSecret,
   trustedOrigins: (
     process.env.FRONTEND_ORIGIN ?? 'http://localhost:4173'
-  ).split(','),
+  )
+    .split(',')
+    .map((o) => o.trim())
+    .filter(Boolean),
   database: authDatabase,
   emailAndPassword: {
     enabled: true,
