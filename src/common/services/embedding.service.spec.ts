@@ -232,4 +232,59 @@ describe('EmbeddingService', () => {
       );
     });
   });
+
+  describe('Redis Vector Caching', () => {
+    it('returns cached vector from Redis without calling TEI', async () => {
+      const cachedVector = [0.99, 0.88, 0.77];
+      const mockRedis = {
+        get: jest.fn().mockResolvedValue(JSON.stringify(cachedVector)),
+        set: jest.fn(),
+      };
+      const fetchMock = jest.fn();
+      globalThis.fetch = fetchMock;
+
+      const service = new EmbeddingService(
+        {
+          getOrThrow: jest.fn().mockReturnValue('http://tei-embeddings:80'),
+        } as unknown as ConfigService,
+        mockRedis as any,
+      );
+
+      const result = await service.embed('cached query text');
+      expect(result).toEqual(cachedVector);
+      expect(mockRedis.get).toHaveBeenCalledWith(
+        expect.stringMatching(/^query:embed:[a-f0-9]{64}$/),
+      );
+      expect(fetchMock).not.toHaveBeenCalled();
+    });
+
+    it('stores vector in Redis on cache miss with 24-hour TTL', async () => {
+      const teiVector = [0.11, 0.22, 0.33];
+      const mockRedis = {
+        get: jest.fn().mockResolvedValue(null),
+        set: jest.fn().mockResolvedValue('OK'),
+      };
+      const fetchMock = jest.fn().mockResolvedValue({
+        ok: true,
+        text: () => Promise.resolve(JSON.stringify([teiVector])),
+      });
+      globalThis.fetch = fetchMock;
+
+      const service = new EmbeddingService(
+        {
+          getOrThrow: jest.fn().mockReturnValue('http://tei-embeddings:80'),
+        } as unknown as ConfigService,
+        mockRedis as any,
+      );
+
+      const result = await service.embed('new query text');
+      expect(result).toEqual(teiVector);
+      expect(fetchMock).toHaveBeenCalled();
+      expect(mockRedis.set).toHaveBeenCalledWith(
+        expect.stringMatching(/^query:embed:[a-f0-9]{64}$/),
+        JSON.stringify(teiVector),
+        86400,
+      );
+    });
+  });
 });

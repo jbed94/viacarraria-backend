@@ -192,6 +192,7 @@ describe('AuthService', () => {
         role: 'user',
         preferredLanguage: 'pl',
         storageLimitMb: null,
+        emailVerified: false,
       });
     });
 

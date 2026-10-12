@@ -2,6 +2,8 @@ import { betterAuth } from 'better-auth';
 import { anonymous } from 'better-auth/plugins';
 import { Pool } from 'pg';
 
+import { sharedMailService } from './common/services/mail.service.js';
+
 const databaseUrl = process.env.DATABASE_URL;
 if (!databaseUrl) {
   throw new Error('DATABASE_URL is required to configure Better Auth.');
@@ -38,16 +40,35 @@ export const auth = betterAuth({
   baseURL: cleanBaseUrl,
   basePath: '/api/auth',
   secret: betterAuthSecret,
-  trustedOrigins: (
-    process.env.FRONTEND_ORIGIN ?? 'http://localhost:4173'
-  )
+  trustedOrigins: (process.env.FRONTEND_ORIGIN ?? 'http://localhost:4173')
     .split(',')
     .map((o) => o.trim())
     .filter(Boolean),
   database: authDatabase,
   emailAndPassword: {
     enabled: true,
-    autoSignIn: true,
+    autoSignIn: false,
+    requireEmailVerification:
+      process.env.REQUIRE_EMAIL_VERIFICATION === 'true' ||
+      process.env.NODE_ENV !== 'test',
+  },
+  emailVerification: {
+    sendOnSignUp: true,
+    autoSignInAfterVerification: true,
+    expiresIn: 24 * 60 * 60,
+    sendVerificationEmail: async ({ user, token }) => {
+      const frontendOrigin =
+        (process.env.FRONTEND_ORIGIN ?? 'http://localhost:4173')
+          .split(',')[0]
+          ?.trim() || 'http://localhost:4173';
+      const verificationUrl = `${cleanBaseUrl}/api/auth/verify-email?token=${encodeURIComponent(token)}&callbackURL=${encodeURIComponent(`${frontendOrigin}/?verified=true`)}`;
+      await sharedMailService.sendVerificationEmail({
+        to: user.email,
+        name: user.name,
+        url: verificationUrl,
+        token,
+      });
+    },
   },
   user: {
     modelName: 'User',

@@ -1,5 +1,8 @@
-import { Injectable } from '@nestjs/common';
+import { Injectable, Optional } from '@nestjs/common';
 import { ConfigService } from '@nestjs/config';
+import { createHash } from 'crypto';
+
+import { RedisService } from './redis.service.js';
 
 export const MAX_EMBEDDING_TEXT_CHARS = 1000;
 
@@ -13,12 +16,34 @@ export type TeiModelInfo = {
 @Injectable()
 export class EmbeddingService {
   private readonly baseUrl: string;
+  private readonly configuredPrefix?: string;
   private modelInfo?: TeiModelInfo;
   private isNegotiated = false;
   private negotiationPromise?: Promise<TeiModelInfo>;
 
-  constructor(config: ConfigService) {
+  constructor(
+    config: ConfigService,
+    @Optional() private readonly redis?: RedisService,
+  ) {
     this.baseUrl = config.getOrThrow<string>('TEI_URL').replace(/\/$/, '');
+    this.configuredPrefix =
+      typeof config?.get === 'function'
+        ? config.get<string>('EMBEDDING_QUERY_PREFIX')
+        : undefined;
+  }
+
+  getQueryPrefix(): string {
+    if (typeof this.configuredPrefix === 'string') {
+      return this.configuredPrefix;
+    }
+    const modelId = this.modelInfo?.modelId?.toLowerCase() ?? '';
+    if (modelId.includes('bge') || modelId.includes('arctic')) {
+      return 'Represent this sentence for searching relevant passages: ';
+    }
+    if (modelId.includes('e5')) {
+      return 'query: ';
+    }
+    return '';
   }
 
   getModelInfo(): TeiModelInfo | undefined {
@@ -102,9 +127,45 @@ export class EmbeddingService {
     return this.negotiationPromise;
   }
 
-  async embed(text: string): Promise<number[] | undefined> {
-    const results = await this.embedBatch([text]);
-    return results[0];
+  async embed(
+    text: string,
+    options?: { isQuery?: boolean },
+  ): Promise<number[] | undefined> {
+    if (!text || typeof text !== 'string') return undefined;
+    const trimmed = text.trim();
+    if (!trimmed) return undefined;
+
+    const prefix = options?.isQuery !== false ? this.getQueryPrefix() : '';
+    const textToEmbed = prefix ? `${prefix}${trimmed}` : trimmed;
+
+    const cacheKey = `query:embed:${createHash('sha256').update(textToEmbed).digest('hex')}`;
+    if (this.redis) {
+      try {
+        const cached = await this.redis.get(cacheKey);
+        if (cached) {
+          const parsed = JSON.parse(cached) as unknown;
+          if (Array.isArray(parsed) && parsed.length > 0) {
+            return parsed as number[];
+          }
+        }
+      } catch {
+        // Non-blocking on cache read failure
+      }
+    }
+
+    const results = await this.embedBatch([textToEmbed]);
+    const vector = results[0];
+
+    if (vector && this.redis) {
+      try {
+        // Cache vector for 24 hours (86400 seconds)
+        await this.redis.set(cacheKey, JSON.stringify(vector), 86400);
+      } catch {
+        // Non-blocking on cache write failure
+      }
+    }
+
+    return vector;
   }
 
   async embedBatch(texts: string[]): Promise<Array<number[] | undefined>> {
@@ -127,7 +188,7 @@ export class EmbeddingService {
         signal: controller.signal,
       });
       if (!response.ok) {
-        return new Array(texts.length).fill(undefined);
+        return new Array<number[] | undefined>(texts.length).fill(undefined);
       }
       const body = JSON.parse(await response.text()) as unknown;
       const values = isUnknownArray(body)
@@ -137,7 +198,7 @@ export class EmbeddingService {
           : undefined;
 
       if (!Array.isArray(values)) {
-        return new Array(texts.length).fill(undefined);
+        return new Array<number[] | undefined>(texts.length).fill(undefined);
       }
 
       return texts.map((_, i) => {
@@ -148,7 +209,7 @@ export class EmbeddingService {
           : undefined;
       });
     } catch {
-      return new Array(texts.length).fill(undefined);
+      return new Array<number[] | undefined>(texts.length).fill(undefined);
     } finally {
       clearTimeout(timeout);
     }

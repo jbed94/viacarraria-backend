@@ -237,6 +237,7 @@ export class WeaviateService {
     limit = 25,
     minScore?: number,
     tier?: SubscriptionTier,
+    alpha?: number,
   ): Promise<VectorizedSearchChunk[]> {
     if (this.similarityQueue) {
       return this.similarityQueue.enqueue(tier, () =>
@@ -247,6 +248,7 @@ export class WeaviateService {
           vector,
           limit,
           minScore,
+          alpha,
         ),
       );
     }
@@ -257,6 +259,7 @@ export class WeaviateService {
       vector,
       limit,
       minScore,
+      alpha,
     );
   }
 
@@ -267,6 +270,7 @@ export class WeaviateService {
     vector: number[],
     limit = 25,
     minScore?: number,
+    alpha?: number,
   ): Promise<VectorizedSearchChunk[]> {
     if (selectedNodeIds.length === 0) {
       return [];
@@ -276,16 +280,18 @@ export class WeaviateService {
       ? Math.min(limit * 2, 50)
       : limit;
     const nodeFilter = this.buildNodeFilter(selectedNodeIds);
+    const effectiveAlpha =
+      typeof alpha === 'number' && alpha >= 0 && alpha <= 1 ? alpha : 0.7;
     const graphQuery = `{
       Get {
         Chunk(
           tenant: ${JSON.stringify(graphId)}
-          hybrid: { query: ${JSON.stringify(query)}, vector: ${JSON.stringify(vector)}, alpha: 0.7 }
+          hybrid: { query: ${JSON.stringify(query)}, vector: ${JSON.stringify(vector)}, alpha: ${effectiveAlpha} }
           where: ${nodeFilter}
           limit: ${candidateLimit}
         ) {
           graphId sourceId sourceName nodeId content context startChar endChar pageNum coordinates elementType imageAssetUrl lqip
-          _additional { score vector }
+          _additional { score certainty distance vector }
         }
       }
     }`;
@@ -364,7 +370,7 @@ export class WeaviateService {
           limit: ${limit}
         ) {
           graphId sourceId sourceName nodeId content context startChar endChar pageNum coordinates elementType imageAssetUrl lqip
-          _additional { score vector }
+          _additional { score certainty distance vector }
         }
       }
     }`;
@@ -444,7 +450,7 @@ export class WeaviateService {
           limit: ${q.limit}
         ) {
           graphId sourceId sourceName nodeId content context startChar endChar pageNum coordinates elementType imageAssetUrl lqip
-          _additional { score vector }
+          _additional { score certainty distance vector }
         }
       `);
     });
@@ -507,12 +513,36 @@ export class WeaviateService {
         return [];
       }
       const additional = item._additional as
-        { score?: string; vector?: unknown[] } | undefined;
+        | {
+            score?: string | number;
+            certainty?: string | number;
+            distance?: string | number;
+            vector?: unknown[];
+          }
+        | undefined;
       const vector = Array.isArray(additional?.vector)
         ? additional.vector.filter(
             (value): value is number => typeof value === 'number',
           )
         : undefined;
+
+      let score = 0;
+      if (additional?.score !== undefined && additional?.score !== null) {
+        score = Number.parseFloat(String(additional.score));
+      } else if (
+        additional?.certainty !== undefined &&
+        additional?.certainty !== null
+      ) {
+        score = Number.parseFloat(String(additional.certainty));
+      } else if (
+        additional?.distance !== undefined &&
+        additional?.distance !== null
+      ) {
+        score = Math.max(0, 1 - Number.parseFloat(String(additional.distance)));
+      }
+      if (Number.isNaN(score)) {
+        score = 0;
+      }
       return [
         {
           nodeId,
@@ -535,7 +565,7 @@ export class WeaviateService {
               ? item.imageAssetUrl
               : undefined,
           lqip: typeof item.lqip === 'string' ? item.lqip : undefined,
-          score: Number.parseFloat(additional?.score ?? '0'),
+          score,
           ...(vector?.length ? { vector } : {}),
         },
       ];
@@ -584,6 +614,12 @@ export class WeaviateService {
             enabled: this.pqEnabled,
             trainingLimit: this.pqTrainingLimit,
             segments: this.pqSegments,
+          },
+        },
+        invertedIndexConfig: {
+          bm25: {
+            b: 0.4,
+            k1: 1.2,
           },
         },
         multiTenancyConfig: {
@@ -636,10 +672,4 @@ export class WeaviateService {
       clearTimeout(timeout);
     }
   }
-}
-
-function withoutVector(chunk: VectorizedSearchChunk): SearchChunk {
-  const copy = { ...chunk };
-  delete copy.vector;
-  return copy;
 }

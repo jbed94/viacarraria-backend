@@ -43,6 +43,36 @@ export const TAG_MATCHING_QUEUE = 'tag_matching_queue';
 export const TAG_MATCHING_DLX = 'tag_matching_dlx';
 export const TAG_MATCHING_DLQ = 'tag_matching_dlq';
 
+export type CrawlJob = {
+  jobId: string;
+  userId: string;
+  tier: string;
+  isGuest: boolean;
+  graphId: string;
+  dto: Record<string, unknown>;
+  priority?: number;
+  retryCount?: number;
+  maxRetries?: number;
+  createdAt: string;
+};
+
+export const CRAWL_QUEUE = 'graph_crawl_queue';
+export const CRAWL_DLX = 'graph_crawl_dlx';
+export const CRAWL_DLQ = 'graph_crawl_dlq';
+
+export type BatchRerankJob = {
+  jobId: string;
+  items: Array<{ query: string; texts: string[] }>;
+  priority?: number;
+  retryCount?: number;
+  maxRetries?: number;
+  createdAt?: string;
+};
+
+export const BATCH_RERANK_QUEUE = 'batch_rerank_queue';
+export const BATCH_RERANK_DLX = 'batch_rerank_dlx';
+export const BATCH_RERANK_DLQ = 'batch_rerank_dlq';
+
 @Injectable()
 export class RabbitMqService implements OnModuleInit, OnModuleDestroy {
   private readonly logger = new Logger(RabbitMqService.name);
@@ -101,6 +131,80 @@ export class RabbitMqService implements OnModuleInit, OnModuleDestroy {
         priority: payload.priority,
       },
     );
+  }
+
+  async publishCrawlJob(job: CrawlJob): Promise<void> {
+    const channel = await this.ensureChannel();
+    const payload: CrawlJob = {
+      ...job,
+      priority: job.priority ?? 5,
+      retryCount: job.retryCount ?? 0,
+      maxRetries: job.maxRetries ?? 2,
+    };
+    channel.sendToQueue(CRAWL_QUEUE, Buffer.from(JSON.stringify(payload)), {
+      contentType: 'application/json',
+      persistent: true,
+      priority: payload.priority,
+    });
+  }
+
+  async consumeCrawlJobs(
+    handler: (job: CrawlJob) => Promise<void>,
+  ): Promise<void> {
+    const channel = await this.ensureChannel();
+    await channel.prefetch(2);
+    await channel.consume(CRAWL_QUEUE, async (msg) => {
+      if (!msg) return;
+      try {
+        const job = JSON.parse(msg.content.toString('utf-8')) as CrawlJob;
+        await handler(job);
+        channel.ack(msg);
+      } catch (err: unknown) {
+        this.logger.error(
+          `Error executing crawl job from queue: ${this.message(err)}`,
+        );
+        channel.nack(msg, false, false);
+      }
+    });
+  }
+
+  async publishBatchRerankJob(job: BatchRerankJob): Promise<void> {
+    const channel = await this.ensureChannel();
+    const payload: BatchRerankJob = {
+      ...job,
+      priority: job.priority ?? 5,
+      retryCount: job.retryCount ?? 0,
+      maxRetries: job.maxRetries ?? 2,
+    };
+    channel.sendToQueue(
+      BATCH_RERANK_QUEUE,
+      Buffer.from(JSON.stringify(payload)),
+      {
+        contentType: 'application/json',
+        persistent: true,
+        priority: payload.priority,
+      },
+    );
+  }
+
+  async consumeBatchRerankJobs(
+    handler: (job: BatchRerankJob) => Promise<void>,
+  ): Promise<void> {
+    const channel = await this.ensureChannel();
+    await channel.prefetch(2);
+    await channel.consume(BATCH_RERANK_QUEUE, async (msg) => {
+      if (!msg) return;
+      try {
+        const job = JSON.parse(msg.content.toString('utf-8')) as BatchRerankJob;
+        await handler(job);
+        channel.ack(msg);
+      } catch (err: unknown) {
+        this.logger.error(
+          `Error executing batch rerank job from queue: ${this.message(err)}`,
+        );
+        channel.nack(msg, false, false);
+      }
+    });
   }
 
   async publishToDlq(
@@ -216,6 +320,78 @@ export class RabbitMqService implements OnModuleInit, OnModuleDestroy {
         await this.channel.assertQueue(TAG_MATCHING_QUEUE, {
           durable: true,
           arguments: tagQueueArgs,
+        });
+      } else {
+        throw err;
+      }
+    }
+
+    // 6. Assert Crawl Dead Letter Exchange and Queue
+    await this.channel.assertExchange(CRAWL_DLX, 'direct', {
+      durable: true,
+    });
+    await this.channel.assertQueue(CRAWL_DLQ, { durable: true });
+    await this.channel.bindQueue(CRAWL_DLQ, CRAWL_DLX, CRAWL_DLQ);
+
+    const crawlQueueArgs = {
+      'x-max-priority': 10,
+      'x-dead-letter-exchange': CRAWL_DLX,
+      'x-dead-letter-routing-key': CRAWL_DLQ,
+    };
+
+    try {
+      await this.channel.assertQueue(CRAWL_QUEUE, {
+        durable: true,
+        arguments: crawlQueueArgs,
+      });
+    } catch (err: unknown) {
+      if (err instanceof Error && err.message.includes('PRECONDITION_FAILED')) {
+        this.logger.warn(
+          'Existing crawl queue arguments differ; updating queue with DLX bindings...',
+        );
+        this.channel = await this.connection.createChannel();
+        await this.channel.deleteQueue(CRAWL_QUEUE);
+        await this.channel.assertQueue(CRAWL_QUEUE, {
+          durable: true,
+          arguments: crawlQueueArgs,
+        });
+      } else {
+        throw err;
+      }
+    }
+
+    // 7. Assert Batch Rerank Dead Letter Exchange and Queue
+    await this.channel.assertExchange(BATCH_RERANK_DLX, 'direct', {
+      durable: true,
+    });
+    await this.channel.assertQueue(BATCH_RERANK_DLQ, { durable: true });
+    await this.channel.bindQueue(
+      BATCH_RERANK_DLQ,
+      BATCH_RERANK_DLX,
+      BATCH_RERANK_DLQ,
+    );
+
+    const batchRerankQueueArgs = {
+      'x-max-priority': 10,
+      'x-dead-letter-exchange': BATCH_RERANK_DLX,
+      'x-dead-letter-routing-key': BATCH_RERANK_DLQ,
+    };
+
+    try {
+      await this.channel.assertQueue(BATCH_RERANK_QUEUE, {
+        durable: true,
+        arguments: batchRerankQueueArgs,
+      });
+    } catch (err: unknown) {
+      if (err instanceof Error && err.message.includes('PRECONDITION_FAILED')) {
+        this.logger.warn(
+          'Existing batch rerank queue arguments differ; updating queue with DLX bindings...',
+        );
+        this.channel = await this.connection.createChannel();
+        await this.channel.deleteQueue(BATCH_RERANK_QUEUE);
+        await this.channel.assertQueue(BATCH_RERANK_QUEUE, {
+          durable: true,
+          arguments: batchRerankQueueArgs,
         });
       } else {
         throw err;

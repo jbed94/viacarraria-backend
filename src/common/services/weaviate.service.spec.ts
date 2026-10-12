@@ -390,4 +390,71 @@ describe('WeaviateService - Batch Ingestion', () => {
     expect(invalidMap.get('empty-nodes')).toEqual([]);
     expect(mockFetch).not.toHaveBeenCalled();
   });
+
+  it('correctly falls back to certainty and distance when score is absent in _additional', async () => {
+    mockFetch.mockImplementation((url: string) => {
+      const urlStr = url.toString();
+      if (urlStr.includes('/v1/schema/Chunk')) {
+        return Promise.resolve({
+          ok: true,
+          status: 200,
+          json: () => Promise.resolve({ properties: [{ name: 'pageNum' }] }),
+        });
+      }
+      if (urlStr.includes('/v1/graphql')) {
+        return Promise.resolve({
+          ok: true,
+          status: 200,
+          json: () =>
+            Promise.resolve({
+              data: {
+                Get: {
+                  b_0: [
+                    {
+                      graphId: 'graph-test',
+                      sourceId: 'src-1',
+                      sourceName: 'CertaintyDoc.pdf',
+                      nodeId: 'node-A',
+                      content: 'Node A chunk using certainty.',
+                      context: 'Context A',
+                      startChar: 0,
+                      endChar: 25,
+                      pageNum: 1,
+                      _additional: { certainty: 0.82, vector: [0.1, 0.2] },
+                    },
+                    {
+                      graphId: 'graph-test',
+                      sourceId: 'src-2',
+                      sourceName: 'DistanceDoc.pdf',
+                      nodeId: 'node-A',
+                      content: 'Node A chunk using distance.',
+                      context: 'Context A',
+                      startChar: 26,
+                      endChar: 55,
+                      pageNum: 1,
+                      _additional: { distance: 0.15, vector: [0.3, 0.4] },
+                    },
+                  ],
+                },
+              },
+            }),
+        });
+      }
+      return Promise.resolve({ ok: true, status: 200 });
+    });
+
+    const resultMap = await service.multiVectorSearch('graph-test', [
+      {
+        id: 'branch-fallback',
+        vector: [0.1, 0.2],
+        adjacentNodeIds: ['node-A'],
+        limit: 5,
+      },
+    ]);
+
+    const hits = resultMap.get('branch-fallback');
+    expect(hits).toHaveLength(2);
+    expect(hits![0]?.score).toBe(0.82);
+    expect(hits![1]?.score).toBeCloseTo(0.85); // 1 - 0.15 = 0.85
+  });
 });

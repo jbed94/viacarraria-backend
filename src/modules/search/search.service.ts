@@ -24,6 +24,10 @@ import { EmbeddingService } from '../../common/services/embedding.service.js';
 import { RedisService } from '../../common/services/redis.service.js';
 import { RerankService } from '../../common/services/rerank.service.js';
 import {
+  RabbitMqService,
+  type CrawlJob,
+} from '../../common/services/rabbitmq.service.js';
+import {
   WeaviateService,
   type VectorSearchQuery,
   type VectorizedSearchChunk,
@@ -42,6 +46,7 @@ import type {
   CrawlDepth,
   CrawlDirection,
   CrawlDto,
+  CrawlJobResponse,
   CrawlEdge,
   CrawlMatchType,
   CrawlNode,
@@ -55,6 +60,9 @@ import type {
 import {
   adjacentNodes,
   applyTabularBoosting,
+  blendVectorMomentum,
+  calculateDynamicAlpha,
+  chunkArray,
   chunkText,
   classifyCrawlCandidate,
   computeBranchEntropy,
@@ -67,16 +75,21 @@ import {
   determineAnswerType,
   expandQueryKeywords,
   extractSharedKeywords,
+  filterLeadAnswerCandidate,
+  formatRerankPassage,
   groupChunks,
+  isHeadingOrTitleChunk,
   isTableChunk,
   isTabularQuery,
-  lexicalScore,
+  matchesTopicTerms,
   pruneAndDeduplicateBranches,
   selectDiverseBranches,
   selectDiverseCandidatesMmr,
   type ClassifiedCandidateItem,
   type DatabaseChunk,
 } from './search.utils.js';
+
+export const CRAWL_NODE_BATCH_SIZE = 100;
 
 export type RetrievedChunk = {
   chunk: SearchChunk;
@@ -128,6 +141,7 @@ export class SearchService implements OnApplicationBootstrap, OnModuleDestroy {
     private readonly auth: AuthService,
     private readonly authorization: AuthorizationService,
     @Optional() private readonly redisService?: RedisService,
+    @Optional() private readonly rabbitMqService?: RabbitMqService,
   ) {}
 
   private readonly activeCrawlControllers = new Map<string, AbortController>();
@@ -265,6 +279,33 @@ export class SearchService implements OnApplicationBootstrap, OnModuleDestroy {
 
   async onApplicationBootstrap(): Promise<void> {
     await this.initPubSubSubscriber();
+    const warmupPromise = this.warmupSystemGraphs();
+    if (process.env.NODE_ENV === 'test') {
+      await warmupPromise;
+    }
+    const workerRole = process.env.WORKER_ROLE ?? 'all';
+    const shouldConsumeCrawl = workerRole === 'all' || workerRole === 'crawl';
+    if (this.rabbitMqService && shouldConsumeCrawl) {
+      try {
+        await this.rabbitMqService.consumeCrawlJobs(async (job) => {
+          await this.processCrawlJob(job);
+        });
+        this.logger.log(
+          `Subscribed to RabbitMQ graph_crawl_queue (role: ${workerRole})`,
+        );
+      } catch (err: unknown) {
+        this.logger.warn(
+          `Failed to subscribe to graph_crawl_queue: ${String(err)}`,
+        );
+      }
+    } else if (this.rabbitMqService) {
+      this.logger.log(
+        `Skipped RabbitMQ graph_crawl_queue subscription (role: ${workerRole})`,
+      );
+    }
+  }
+
+  async warmupSystemGraphs(): Promise<void> {
     try {
       const ready = await this.weaviate.isReady();
       if (!ready) {
@@ -572,7 +613,7 @@ export class SearchService implements OnApplicationBootstrap, OnModuleDestroy {
     const synonyms = await this.getActiveSynonyms();
     const { expandedKeywords } = expandQueryKeywords(queryText, synonyms);
 
-    const retrieved = await this.retrieve(
+    let retrieved = await this.retrieve(
       graph.id,
       queryText,
       selectedNodeIds,
@@ -584,41 +625,59 @@ export class SearchService implements OnApplicationBootstrap, OnModuleDestroy {
 
     if (retrieved.length > 0 && queryText) {
       try {
-        const rerankResults = await this.rerank.rerank(
-          queryText,
-          retrieved.map((r) => r.chunk.content),
+        const candidatesToRerank = retrieved.slice(0, 24);
+        const rerankTexts = candidatesToRerank.map((r) =>
+          formatRerankPassage(r.chunk),
         );
+
+        const rerankResults = await this.rerank.rerank(queryText, rerankTexts);
         if (rerankResults && rerankResults.length > 0) {
           for (const item of rerankResults) {
-            const target = retrieved[item.index];
+            const target = candidatesToRerank[item.index];
             if (target) {
               target.chunk.rerankScore = item.score;
               target.chunk.score = item.score;
             }
           }
-          retrieved.sort(
+          candidatesToRerank.sort(
             (a, b) =>
               (b.chunk.rerankScore ?? b.chunk.score) -
               (a.chunk.rerankScore ?? a.chunk.score),
           );
+          retrieved = [
+            ...candidatesToRerank,
+            ...retrieved.slice(candidatesToRerank.length),
+          ];
+        } else if (this.rerank.isConfigured()) {
+          this.logger.debug(
+            `Reranker is configured but yielded no results for "${queryText.slice(0, 30)}"; using first-stage ranking.`,
+          );
         }
-      } catch {
-        // Fall back to initial retrieval ordering if reranker fails
+      } catch (err: unknown) {
+        this.logger.warn(
+          `Reranking pass degraded for query "${queryText.slice(0, 30)}", falling back to first-stage ranking: ${String(err)}`,
+        );
       }
     }
 
-    const chunks = retrieved.map(({ chunk }) => ({
+    const substantiveRetrieved = retrieved.filter(
+      (r) => !isHeadingOrTitleChunk(r.chunk),
+    );
+    const effectiveRetrieved =
+      substantiveRetrieved.length > 0 ? substantiveRetrieved : retrieved;
+
+    const chunks = effectiveRetrieved.map(({ chunk }) => ({
       ...chunk,
       kind: 'MATCH' as const,
     }));
     const results = groupChunks(chunks, scope);
 
     let leadAnswer: LeadAnswer | undefined = undefined;
-    const topChunk = chunks[0];
-    if (topChunk) {
+    const leadCandidate = filterLeadAnswerCandidate(chunks);
+    if (leadCandidate) {
       const nodeMap = new Map(graph.nodes.map((n) => [n.id, n]));
       const prerequisiteNodes = graph.edges
-        .filter((edge) => edge.target === topChunk.nodeId)
+        .filter((edge) => edge.target === leadCandidate.nodeId)
         .map((edge) => ({
           id: edge.source,
           title: nodeMap.get(edge.source)?.data?.title || edge.source,
@@ -628,7 +687,7 @@ export class SearchService implements OnApplicationBootstrap, OnModuleDestroy {
         );
 
       const extensionNodes = graph.edges
-        .filter((edge) => edge.source === topChunk.nodeId)
+        .filter((edge) => edge.source === leadCandidate.nodeId)
         .map((edge) => ({
           id: edge.target,
           title: nodeMap.get(edge.target)?.data?.title || edge.target,
@@ -638,9 +697,9 @@ export class SearchService implements OnApplicationBootstrap, OnModuleDestroy {
         );
 
       leadAnswer = {
-        chunk: topChunk,
-        score: topChunk.rerankScore ?? topChunk.score,
-        answerType: determineAnswerType(topChunk),
+        chunk: leadCandidate,
+        score: leadCandidate.rerankScore ?? leadCandidate.score,
+        answerType: determineAnswerType(leadCandidate),
         prerequisiteNodes,
         extensionNodes,
       };
@@ -800,21 +859,29 @@ export class SearchService implements OnApplicationBootstrap, OnModuleDestroy {
         const vector = await this.embeddings.embed(query);
         if (vector) {
           const { expandedQuery } = expandQueryKeywords(query, customSynonyms);
+          const dynamicAlpha = calculateDynamicAlpha(query);
+          const fetchLimit = Math.max(matchLimit * 2, 24);
           const indexed = await this.weaviate.hybridSearch(
             graphId,
             expandedQuery,
             nodeIds,
             vector,
-            matchLimit,
+            fetchLimit,
             vectorThreshold,
             tier,
+            dynamicAlpha,
           );
           if (indexed.length > 0) {
             const raw = indexed.map(({ vector, ...chunk }) => ({
               chunk,
               vector,
             }));
-            textRetrieved = applyTabularBoosting(raw, query);
+            const boosted = applyTabularBoosting(raw, query);
+            const substantiveOnly = boosted.filter(
+              (r) => !isHeadingOrTitleChunk(r.chunk),
+            );
+            textRetrieved =
+              substantiveOnly.length > 0 ? substantiveOnly : boosted;
           }
         }
       } catch {
@@ -826,36 +893,238 @@ export class SearchService implements OnApplicationBootstrap, OnModuleDestroy {
       return textRetrieved.slice(0, matchLimit);
     }
 
-    // 4. Fallback to SQL / lexical chunking if query is present
-    if (!query) {
-      return [];
+    return [];
+  }
+
+  async enqueueCrawl(
+    identity: ViewerIdentity | undefined,
+    dto: CrawlDto,
+  ): Promise<CrawlJobResponse> {
+    const viewer = this.auth.requireIdentity(identity);
+    const graph = await this.graphs.findAccessible(viewer, dto.graphId);
+    this.authorization.assertCan(viewer, 'query', 'Graph', graph);
+    if (!graph.isPrepared && graph.userId !== viewer.userId) {
+      const isAttached = await this.graphs.isAttached(viewer.userId, graph.id);
+      if (!isAttached) {
+        throw new ForbiddenException(
+          'Please attach to this graph to enable querying.',
+        );
+      }
     }
 
-    const sources = await this.database.query<DatabaseChunk>(
-      `SELECT "id", "nodeId", "name", "content" FROM "NodeSource"
-       WHERE "graphId" = $1 AND "nodeId" = ANY($2::text[]) AND "content" IS NOT NULL AND "status" = 'READY'`,
-      [graphId, nodeIds],
+    const availableNodeIds = new Set(graph.nodes.map((node) => node.id));
+    let startingNodeIds = [...new Set(dto.startingNodeIds ?? [])];
+    if (
+      startingNodeIds.length === 0 &&
+      dto.hypothesisGroups &&
+      dto.hypothesisGroups.length > 0
+    ) {
+      startingNodeIds = [
+        ...new Set(dto.hypothesisGroups.flatMap((g) => g.nodeIds ?? [])),
+      ];
+    }
+    if (dto.groupBStartingNodeIds && dto.groupBStartingNodeIds.length > 0) {
+      for (const id of dto.groupBStartingNodeIds) {
+        if (!startingNodeIds.includes(id)) {
+          startingNodeIds.push(id);
+        }
+      }
+    }
+
+    if (
+      startingNodeIds.length === 0 ||
+      startingNodeIds.some((nodeId) => !availableNodeIds.has(nodeId))
+    ) {
+      throw new BadRequestException(
+        'Select at least one starting node from the active graph.',
+      );
+    }
+
+    const crawlDepth: CrawlDepth | undefined = dto.crawlDepth;
+    const comparativeMode = Boolean(dto.comparativeMode);
+
+    if (viewer.tier === 'ANONYMOUS' || viewer.isGuest) {
+      if (startingNodeIds.length > 1) {
+        throw new ForbiddenException(
+          'Anonymous crawl is limited to 1 starting point. Register for free to crawl from multiple starting points.',
+        );
+      }
+      if (crawlDepth && crawlDepth !== 'shallow') {
+        throw new ForbiddenException(
+          'Anonymous crawl is limited to shallow crawl depth. Register for free to explore deeper knowledge frontiers.',
+        );
+      }
+      if (comparativeMode) {
+        throw new ForbiddenException(
+          'Comparative hypothesis crawl requires a registered account. Register for free to compare hypotheses.',
+        );
+      }
+    } else if (
+      comparativeMode &&
+      dto.hypothesisGroups &&
+      dto.hypothesisGroups.length > 4
+    ) {
+      throw new ForbiddenException(
+        'Comparative hypothesis crawl supports up to 4 hypothesis groups.',
+      );
+    }
+
+    const jobId = dto.jobId || `crawl-${randomUUID()}`;
+    const initialJob: CrawlJobResponse = {
+      jobId,
+      status: 'QUEUED',
+      graphId: dto.graphId,
+      message: 'Crawl job queued for background execution.',
+      createdAt: new Date().toISOString(),
+    };
+
+    if (this.redisService) {
+      await this.redisService.set(
+        `crawl:job:${jobId}`,
+        JSON.stringify(initialJob),
+        3600,
+      );
+    }
+
+    if (this.rabbitMqService) {
+      await this.rabbitMqService.publishCrawlJob({
+        jobId,
+        userId: viewer.userId,
+        tier: viewer.tier,
+        isGuest: viewer.isGuest,
+        graphId: dto.graphId,
+        dto: { ...dto, jobId } as unknown as Record<string, unknown>,
+        priority: viewer.tier === 'REGISTERED' ? 8 : 2,
+        createdAt: new Date().toISOString(),
+      });
+    } else {
+      void this.crawl(identity, { ...dto, jobId }).catch((err: unknown) => {
+        this.logger.error(`Fallback background crawl failed: ${String(err)}`);
+      });
+    }
+
+    return initialJob;
+  }
+
+  async getCrawlJob(
+    identity: ViewerIdentity | undefined,
+    jobId: string,
+  ): Promise<CrawlJobResponse> {
+    this.auth.requireIdentity(identity);
+    if (this.redisService) {
+      try {
+        const raw = await this.redisService.get(`crawl:job:${jobId}`);
+        if (raw) {
+          return JSON.parse(raw) as CrawlJobResponse;
+        }
+      } catch {
+        // Fall back to database query
+      }
+    }
+
+    const queries = await this.database.query<{
+      id: string;
+      graphId: string;
+      results: unknown;
+      createdAt: Date;
+    }>(
+      `SELECT "id", "graphId", "results", "createdAt" FROM "Query" WHERE "id" = $1 LIMIT 1`,
+      [jobId],
     );
 
-    const minLexScore = 1;
+    if (queries.length > 0 && queries[0]) {
+      const q = queries[0];
+      return {
+        jobId: q.id,
+        status: 'COMPLETED',
+        graphId: q.graphId,
+        result: q.results as CrawlResponse,
+        createdAt: q.createdAt.toISOString(),
+      };
+    }
 
-    const allChunks = sources.flatMap((source) => chunkText(source, graphId));
-    const { expandedQuery } = expandQueryKeywords(query, customSynonyms);
+    throw new NotFoundException(`Crawl job ${jobId} not found.`);
+  }
 
-    return allChunks
-      .map((chunk) => {
-        const baseScore = lexicalScore(chunk.content, expandedQuery);
-        const tableBonus = isTabularQuery(query) && isTableChunk(chunk) ? 3 : 0;
-        return {
-          chunk: {
-            ...chunk,
-            score: baseScore + tableBonus,
-          },
+  async processCrawlJob(job: CrawlJob): Promise<void> {
+    const identity: ViewerIdentity = {
+      userId: job.userId,
+      tier: (job.tier as SubscriptionTier) || 'REGISTERED',
+      isGuest: job.isGuest,
+      email: '',
+      username: '',
+    };
+
+    if (this.redisService) {
+      const processingState: CrawlJobResponse = {
+        jobId: job.jobId,
+        status: 'PROCESSING',
+        graphId: job.graphId,
+        createdAt: job.createdAt,
+      };
+      await this.redisService.set(
+        `crawl:job:${job.jobId}`,
+        JSON.stringify(processingState),
+        3600,
+      );
+    }
+
+    try {
+      const result = await this.crawl(identity, job.dto as unknown as CrawlDto);
+
+      if (this.redisService) {
+        const completedState: CrawlJobResponse = {
+          jobId: job.jobId,
+          status: 'COMPLETED',
+          graphId: job.graphId,
+          result,
+          completedAt: new Date().toISOString(),
         };
-      })
-      .filter(({ chunk }) => chunk.score >= minLexScore)
-      .sort((left, right) => right.chunk.score - left.chunk.score)
-      .slice(0, matchLimit);
+        await this.redisService.set(
+          `crawl:job:${job.jobId}`,
+          JSON.stringify(completedState),
+          3600,
+        );
+      }
+
+      this.publishCrawlProgress(job.graphId, {
+        graphId: job.graphId,
+        level: result.maxLevelReached,
+        status: 'completed',
+        message: 'Crawl completed successfully.',
+        currentNodes: result.nodes,
+        currentEdges: result.edges,
+        matchesCount: result.nodes.length,
+        totalMatches: result.nodes.length,
+        stats: result.stats,
+      });
+    } catch (err: unknown) {
+      const errMsg =
+        err instanceof Error ? err.message : 'Crawl execution failed';
+      this.logger.warn(`Crawl job ${job.jobId} failed: ${errMsg}`);
+
+      if (this.redisService) {
+        const failedState: CrawlJobResponse = {
+          jobId: job.jobId,
+          status: 'FAILED',
+          graphId: job.graphId,
+          error: errMsg,
+          completedAt: new Date().toISOString(),
+        };
+        await this.redisService.set(
+          `crawl:job:${job.jobId}`,
+          JSON.stringify(failedState),
+          3600,
+        );
+      }
+
+      this.publishCrawlProgress(job.graphId, {
+        graphId: job.graphId,
+        level: 0,
+        status: 'failed',
+        message: errMsg,
+      });
+    }
   }
 
   async crawl(
@@ -1150,7 +1419,7 @@ export class SearchService implements OnApplicationBootstrap, OnModuleDestroy {
       const retrieveGroupBestSeed = async (
         nodeIds: string[],
       ): Promise<RetrievedChunk | null> => {
-        const seedRetrieved = await this.retrieve(
+        let seedRetrieved = await this.retrieve(
           graph.id,
           queryText,
           nodeIds,
@@ -1162,23 +1431,28 @@ export class SearchService implements OnApplicationBootstrap, OnModuleDestroy {
 
         if (seedRetrieved.length > 0 && queryText) {
           try {
+            const candidatesToRerank = seedRetrieved.slice(0, 24);
             const rerankResults = await this.rerank.rerank(
               queryText,
-              seedRetrieved.map((r) => r.chunk.content),
+              candidatesToRerank.map((r) => formatRerankPassage(r.chunk)),
             );
             if (rerankResults && rerankResults.length > 0) {
               for (const item of rerankResults) {
-                const target = seedRetrieved[item.index];
+                const target = candidatesToRerank[item.index];
                 if (target) {
                   target.chunk.rerankScore = item.score;
                   target.chunk.score = item.score;
                 }
               }
-              seedRetrieved.sort(
+              candidatesToRerank.sort(
                 (a, b) =>
                   (b.chunk.rerankScore ?? b.chunk.score) -
                   (a.chunk.rerankScore ?? a.chunk.score),
               );
+              seedRetrieved = [
+                ...candidatesToRerank,
+                ...seedRetrieved.slice(candidatesToRerank.length),
+              ];
             }
           } catch {
             // Fall back to initial retrieval ordering
@@ -1204,15 +1478,38 @@ export class SearchService implements OnApplicationBootstrap, OnModuleDestroy {
           }
         }
 
-        return seedRetrieved.length > 0 ? seedRetrieved[0]! : null;
+        const substantiveSeeds = seedRetrieved.filter(
+          (r) => !isHeadingOrTitleChunk(r.chunk),
+        );
+        const candidatePool =
+          substantiveSeeds.length > 0 ? substantiveSeeds : seedRetrieved;
+
+        const substantiveSeed = filterLeadAnswerCandidate(
+          candidatePool.map((r) => r.chunk),
+        );
+        if (substantiveSeed) {
+          const matched = candidatePool.find(
+            (r) => r.chunk === substantiveSeed,
+          );
+          if (matched) return matched;
+        }
+
+        return candidatePool.length > 0 ? candidatePool[0]! : null;
       };
 
       if (isComparative) {
-        for (const g of normalizedGroups) {
-          const bestSeed = await retrieveGroupBestSeed(g.nodeIds);
-          if (!bestSeed) continue;
+        const groupSeedResults = await Promise.all(
+          normalizedGroups.map(async (g) => {
+            const bestSeed = await retrieveGroupBestSeed(g.nodeIds);
+            if (!bestSeed) return null;
+            const seedVector = await resolveSeedVector(bestSeed);
+            return { g, bestSeed, seedVector };
+          }),
+        );
 
-          const seedVector = await resolveSeedVector(bestSeed);
+        for (const item of groupSeedResults) {
+          if (!item) continue;
+          const { g, bestSeed, seedVector } = item;
           const seedNodeTitle =
             nodeMap.get(bestSeed.chunk.nodeId)?.data?.title ||
             bestSeed.chunk.nodeId;
@@ -1373,32 +1670,70 @@ export class SearchService implements OnApplicationBootstrap, OnModuleDestroy {
           break;
         }
 
+        // Pre-warm embeddings in parallel for any active branches missing currentVector
+        const missingVectorContents = [
+          ...new Set(
+            activeBranches
+              .filter(
+                (b) =>
+                  (!b.currentVector || b.currentVector.length === 0) &&
+                  !vectorCache.has(b.currentNode.chunk.content),
+              )
+              .map((b) => b.currentNode.chunk.content),
+          ),
+        ];
+        if (missingVectorContents.length > 0) {
+          await Promise.all(
+            missingVectorContents.map(async (content) => {
+              try {
+                const vec = await this.embeddings.embed(content);
+                if (vec && vec.length > 0) {
+                  vectorCache.set(content, vec);
+                }
+              } catch {
+                // Non-blocking
+              }
+            }),
+          );
+        }
+
         // 1. Prepare target nodes and embeddings across all active branches for batched Weaviate multiVectorSearch
         const branchSearchConfigs = await Promise.all(
           activeBranches.map(async (branch) => {
             const currentTopicTitle =
               nodeMap.get(branch.currentTopicNodeId)?.data?.title ||
               branch.currentTopicNodeId;
-            const candidateNeighbors = connectedNodes(
-              branch.currentTopicNodeId,
-              graph.edges,
-              direction,
-            );
+            const candidateNeighbors =
+              direction === 'global'
+                ? graph.nodes
+                    .map((n) => n.id)
+                    .filter((id) => id !== branch.currentTopicNodeId)
+                : connectedNodes(
+                    branch.currentTopicNodeId,
+                    graph.edges,
+                    direction,
+                  );
             const connectedTopicTitles = candidateNeighbors.map(
               (id) => nodeMap.get(id)?.data?.title || id,
             );
 
             const targetNodeIds: string[] = [];
-            if (enableDigs && branch.digsInCurrentTopic < maxDigsPerTopic) {
-              targetNodeIds.push(branch.currentTopicNodeId);
-            }
-            if (
-              (enableJumps && branch.totalJumps < maxJumps) ||
-              (enableLinks && branch.totalLinks < maxLinks)
-            ) {
-              for (const nid of candidateNeighbors) {
-                if (!targetNodeIds.includes(nid)) {
-                  targetNodeIds.push(nid);
+            if (direction === 'global') {
+              for (const n of graph.nodes) {
+                targetNodeIds.push(n.id);
+              }
+            } else {
+              if (enableDigs && branch.digsInCurrentTopic < maxDigsPerTopic) {
+                targetNodeIds.push(branch.currentTopicNodeId);
+              }
+              if (
+                (enableJumps && branch.totalJumps < maxJumps) ||
+                (enableLinks && branch.totalLinks < maxLinks)
+              ) {
+                for (const nid of candidateNeighbors) {
+                  if (!targetNodeIds.includes(nid)) {
+                    targetNodeIds.push(nid);
+                  }
                 }
               }
             }
@@ -1427,109 +1762,170 @@ export class SearchService implements OnApplicationBootstrap, OnModuleDestroy {
           }),
         );
 
-        // 2. Execute Weaviate multiVectorSearch in a single batched GraphQL query
+        // 2. Execute Weaviate multiVectorSearch in dynamically batched GraphQL queries
         const searchLimit = Math.max(12, maxCandidatesPerStep * 3);
-        const batchQueries: VectorSearchQuery[] = branchSearchConfigs
-          .filter(
-            (cfg) =>
-              cfg.targetNodeIds.length > 0 &&
-              Array.isArray(cfg.nodeVector) &&
-              cfg.nodeVector.length > 0,
-          )
-          .map((cfg) => ({
-            id: cfg.branch.currentNode.id,
-            vector: cfg.nodeVector,
-            adjacentNodeIds: cfg.targetNodeIds,
-            limit: searchLimit,
-          }));
+        const branchBatches: {
+          branchId: string;
+          batchIds: string[];
+        }[] = [];
+        const batchQueries: VectorSearchQuery[] = [];
 
-        let batchedHitsMap = new Map<string, VectorizedSearchChunk[]>();
+        for (const cfg of branchSearchConfigs) {
+          if (
+            cfg.targetNodeIds.length === 0 ||
+            !Array.isArray(cfg.nodeVector) ||
+            cfg.nodeVector.length === 0
+          ) {
+            continue;
+          }
+
+          const nodeBatches = chunkArray(
+            cfg.targetNodeIds,
+            CRAWL_NODE_BATCH_SIZE,
+          );
+          const batchIds: string[] = [];
+
+          nodeBatches.forEach((nodeBatch, bIdx) => {
+            const queryId =
+              nodeBatches.length === 1
+                ? cfg.branch.currentNode.id
+                : `${cfg.branch.currentNode.id}__batch_${bIdx}`;
+            batchIds.push(queryId);
+            batchQueries.push({
+              id: queryId,
+              vector: cfg.nodeVector,
+              adjacentNodeIds: nodeBatch,
+              limit: searchLimit,
+            });
+          });
+
+          branchBatches.push({
+            branchId: cfg.branch.currentNode.id,
+            batchIds,
+          });
+        }
+
+        const rawHitsMap = new Map<string, VectorizedSearchChunk[]>();
         if (batchQueries.length > 0) {
           try {
-            batchedHitsMap = await this.weaviate.multiVectorSearch(
-              graph.id,
-              batchQueries,
-              viewer.tier,
-            );
+            const queryChunks = chunkArray(batchQueries, 20);
+            for (const qChunk of queryChunks) {
+              const resMap = await this.weaviate.multiVectorSearch(
+                graph.id,
+                qChunk,
+                viewer.tier,
+              );
+              for (const [k, v] of resMap.entries()) {
+                rawHitsMap.set(k, v);
+                for (const chunk of v) {
+                  if (chunk.vector && chunk.vector.length > 0) {
+                    vectorCache.set(chunk.content, chunk.vector);
+                  }
+                }
+              }
+            }
           } catch {
             // Fallback to database will occur per branch if Weaviate query fails
           }
         }
 
-        // 3. Evaluate branches and classify candidates with MMR diversity
-        const branchEvaluations = await Promise.all(
-          branchSearchConfigs.map(async (cfg) => {
-            const {
-              branch,
-              currentTopicTitle,
-              candidateNeighbors,
-              connectedTopicTitles,
-              targetNodeIds,
-              currentNodeContent,
-              nodeVector,
-            } = cfg;
-
-            if (targetNodeIds.length === 0) {
-              return { branch, chosenCandidates: [] };
+        // Consolidate batched hits per branch
+        const batchedHitsMap = new Map<string, VectorizedSearchChunk[]>();
+        for (const { branchId, batchIds } of branchBatches) {
+          const combinedHits: VectorizedSearchChunk[] = [];
+          for (const bId of batchIds) {
+            const hits = rawHitsMap.get(bId);
+            if (hits && hits.length > 0) {
+              combinedHits.push(...hits);
             }
+          }
+          if (combinedHits.length > 0) {
+            combinedHits.sort((a, b) => b.score - a.score);
+            batchedHitsMap.set(branchId, combinedHits.slice(0, searchLimit));
+          }
+        }
 
-            let candidateChunks: RetrievedChunk[] = [];
-            const weaviateHits =
-              batchedHitsMap.get(branch.currentNode.id) ?? [];
-            if (weaviateHits.length > 0) {
-              candidateChunks = weaviateHits.map(({ vector, ...chunk }) => {
-                if (vector && vector.length > 0) {
-                  vectorCache.set(chunk.content, vector);
-                }
-                return { chunk, vector };
-              });
-            }
+        // 3. Prepare candidate pools and evaluate frontiers via coordinated batch reranker
+        const preparedBranchCandidates = branchSearchConfigs.map((cfg) => {
+          const { branch, currentNodeContent, targetNodeIds } = cfg;
 
-            if (candidateChunks.length === 0) {
-              const candidateSources = await this.database.query<DatabaseChunk>(
-                `SELECT "id", "nodeId", "name", "content" FROM "NodeSource"
-                 WHERE "graphId" = $1 AND "nodeId" = ANY($2::text[]) AND "content" IS NOT NULL AND "status" = 'READY'`,
-                [graph.id, targetNodeIds],
-              );
-              const allChunks = candidateSources.flatMap((source) =>
-                chunkText(source, graph.id),
-              );
-              candidateChunks = allChunks
-                .map((chunk) => {
-                  const simScore = lexicalScore(
-                    chunk.content,
-                    currentNodeContent,
-                  );
-                  return {
-                    chunk: { ...chunk, score: simScore },
-                  };
-                })
-                .sort((a, b) => b.chunk.score - a.chunk.score)
-                .slice(0, Math.max(12, maxCandidatesPerStep * 3));
-            }
+          if (targetNodeIds.length === 0) {
+            return { cfg, unvisitedCandidates: [] };
+          }
 
-            const unvisitedCandidates = candidateChunks.filter((candidate) => {
-              const cKey = getChunkKey(candidate.chunk);
-              if (branch.visitedChunkKeys.has(cKey)) return false;
-              if (candidate.chunk.content === currentNodeContent) return false;
-              const overlap = lexicalScore(
-                currentNodeContent,
-                candidate.chunk.content,
-              );
-              const words = candidate.chunk.content.split(/\s+/).length;
-              if (words > 0 && overlap / words > 0.85) return false;
-              return true;
+          let candidateChunks: RetrievedChunk[] = [];
+          const weaviateHits = batchedHitsMap.get(branch.currentNode.id) ?? [];
+          if (weaviateHits.length > 0) {
+            candidateChunks = weaviateHits.map(({ vector, ...chunk }) => {
+              if (vector && vector.length > 0) {
+                vectorCache.set(chunk.content, vector);
+              }
+              return { chunk, vector };
             });
 
-            if (unvisitedCandidates.length === 0) {
-              return { branch, chosenCandidates: [] };
-            }
-
-            try {
-              const rerankResults = await this.rerank.rerank(
-                currentNodeContent.slice(0, 300),
-                unvisitedCandidates.map((c) => c.chunk.content),
+            if (isTabularQuery(queryText)) {
+              candidateChunks = applyTabularBoosting(
+                candidateChunks,
+                queryText,
               );
+            }
+            if (expandedKeywords && expandedKeywords.length > 0) {
+              for (const cand of candidateChunks) {
+                const hasKeywordMatch = expandedKeywords.some((kw) =>
+                  matchesTopicTerms(kw, cand.chunk.content),
+                );
+                if (hasKeywordMatch) {
+                  cand.chunk.score = Number(
+                    Math.min(1.0, cand.chunk.score * 1.25).toFixed(4),
+                  );
+                }
+              }
+            }
+          }
+
+          const unvisitedCandidates = candidateChunks.filter((candidate) => {
+            const cKey = getChunkKey(candidate.chunk);
+            if (branch.visitedChunkKeys.has(cKey)) return false;
+            if (candidate.chunk.content === currentNodeContent) return false;
+            if (isHeadingOrTitleChunk(candidate.chunk)) {
+              return false;
+            }
+            return true;
+          });
+
+          return { cfg, unvisitedCandidates };
+        });
+
+        // 3.b Batch rerank across active frontiers
+        const rerankBatchesToRun = preparedBranchCandidates
+          .map((item, originalIndex) => {
+            const queryForBranch = queryText
+              ? `${queryText} (${item.cfg.currentTopicTitle})`
+              : `${item.cfg.currentTopicTitle}: ${item.cfg.currentNodeContent.slice(0, 150)}`;
+
+            return {
+              originalIndex,
+              query: queryForBranch,
+              texts: item.unvisitedCandidates.map((c) =>
+                formatRerankPassage(c.chunk),
+              ),
+            };
+          })
+          .filter((item) => item.texts.length > 0);
+
+        if (rerankBatchesToRun.length > 0) {
+          try {
+            const batchResults = await this.rerank.rerankBatch(
+              rerankBatchesToRun.map((b) => ({
+                query: b.query,
+                texts: b.texts,
+              })),
+            );
+            for (let i = 0; i < rerankBatchesToRun.length; i++) {
+              const { originalIndex } = rerankBatchesToRun[i]!;
+              const rerankResults = batchResults[i];
+              const { unvisitedCandidates } =
+                preparedBranchCandidates[originalIndex]!;
               if (rerankResults && rerankResults.length > 0) {
                 for (const item of rerankResults) {
                   const target = unvisitedCandidates[item.index];
@@ -1544,8 +1940,26 @@ export class SearchService implements OnApplicationBootstrap, OnModuleDestroy {
                     (a.chunk.rerankScore ?? a.chunk.score),
                 );
               }
-            } catch {
-              // Maintain retrieval order
+            }
+          } catch {
+            // Maintain retrieval order
+          }
+        }
+
+        // 3.c Classify candidates and apply MMR diversity per branch
+        const branchEvaluations = preparedBranchCandidates.map(
+          ({ cfg, unvisitedCandidates }) => {
+            const {
+              branch,
+              currentTopicTitle,
+              candidateNeighbors,
+              connectedTopicTitles,
+              currentNodeContent,
+              nodeVector,
+            } = cfg;
+
+            if (unvisitedCandidates.length === 0) {
+              return { branch, chosenCandidates: [] };
             }
 
             const qualifyingCandidates: ClassifiedCandidateItem<RetrievedChunk>[] =
@@ -1557,7 +1971,9 @@ export class SearchService implements OnApplicationBootstrap, OnModuleDestroy {
                 continue;
               }
 
-              const isAdjacent = candidateNeighbors.includes(cand.chunk.nodeId);
+              const isAdjacent =
+                direction === 'global' ||
+                candidateNeighbors.includes(cand.chunk.nodeId);
               const candVector =
                 cand.vector && cand.vector.length > 0
                   ? cand.vector
@@ -1583,6 +1999,7 @@ export class SearchService implements OnApplicationBootstrap, OnModuleDestroy {
                 currentNodeId: branch.currentTopicNodeId,
                 currentTopicTitle,
                 candidateContent: cand.chunk.content,
+                candidateElementType: cand.chunk.elementType,
                 isAdjacentInGraph: isAdjacent,
                 connectedTopicTitles,
                 enableDigs,
@@ -1644,7 +2061,7 @@ export class SearchService implements OnApplicationBootstrap, OnModuleDestroy {
             }));
 
             return { branch, chosenCandidates };
-          }),
+          },
         );
 
         // 2. Batch resolve embeddings across candidates lacking cached vectors
@@ -1685,12 +2102,20 @@ export class SearchService implements OnApplicationBootstrap, OnModuleDestroy {
 
         for (const { branch, chosenCandidates } of branchEvaluations) {
           for (const { candidate, matchType } of chosenCandidates) {
-            let nextVector = candidate.vector;
-            if (!nextVector || nextVector.length === 0) {
-              nextVector =
+            let rawNextVector = candidate.vector;
+            if (!rawNextVector || rawNextVector.length === 0) {
+              rawNextVector =
                 vectorCache.get(candidate.chunk.content) ??
                 branch.currentVector;
             }
+
+            const anchorVector =
+              v0.length > 0 ? v0 : activeBranches[0]?.currentVector;
+            const nextVector = blendVectorMomentum(
+              rawNextVector,
+              anchorVector,
+              0.35,
+            );
 
             let similarityScore: number | undefined = undefined;
             if (branch.currentVector?.length > 0 && nextVector?.length > 0) {

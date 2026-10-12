@@ -677,6 +677,13 @@ describe('SearchService - Ingestion & Bootstrap', () => {
     mockRerank = {
       isConfigured: jest.fn().mockReturnValue(true),
       rerank: jest.fn().mockResolvedValue(undefined),
+      rerankBatch: jest
+        .fn()
+        .mockImplementation((reqs) =>
+          Promise.all(
+            reqs.map((r: any) => mockRerank.rerank!(r.query, r.texts)),
+          ),
+        ),
     };
     mockWeaviate = {
       isReady: jest.fn().mockResolvedValue(true),
@@ -772,6 +779,13 @@ describe('SearchService - Topological Crawl Query Engine', () => {
           })),
         );
       }),
+      rerankBatch: jest
+        .fn()
+        .mockImplementation((reqs) =>
+          Promise.all(
+            reqs.map((r: any) => mockRerank.rerank!(r.query, r.texts)),
+          ),
+        ),
     };
     mockWeaviate = {
       isReady: jest.fn().mockResolvedValue(true),
@@ -965,6 +979,68 @@ describe('SearchService - Topological Crawl Query Engine', () => {
     );
   });
 
+  it('excludes pure heading and title chunks from crawl frontier candidates', async () => {
+    // Starting node points to node-heading and node-step1
+    (mockGraphs.findAccessible as jest.Mock).mockResolvedValueOnce({
+      id: 'graph-1',
+      userId: 'user-1',
+      nodes: [
+        { id: 'node-start', data: { title: 'Starting Topic' } },
+        { id: 'node-heading', data: { title: 'Pure Heading' } },
+        { id: 'node-step1', data: { title: 'Substantive Step 1' } },
+      ],
+      edges: [
+        { id: 'e1', source: 'node-start', target: 'node-heading' },
+        { id: 'e2', source: 'node-start', target: 'node-step1' },
+      ],
+    });
+
+    (mockWeaviate.vectorSearch as jest.Mock).mockResolvedValueOnce([
+      {
+        graphId: 'graph-1',
+        sourceId: 'src-hdr',
+        sourceName: 'Section.md',
+        nodeId: 'node-heading',
+        content: '# Chapter 2: High Level Overview',
+        elementType: 'section_header',
+        score: 0.99,
+        vector: [0.2, 0.3, 0.4],
+      },
+      {
+        graphId: 'graph-1',
+        sourceId: 'src-sub',
+        sourceName: 'Step1.md',
+        nodeId: 'node-step1',
+        content:
+          'Substantive intermediate algorithmic implementation details with complexity notes.',
+        elementType: 'text',
+        score: 0.85,
+        vector: [0.25, 0.35, 0.45],
+      },
+    ]);
+
+    const crawlResponse = await service.crawl(
+      {
+        userId: 'user-1',
+        tier: 'REGISTERED',
+        email: 'user@test.com',
+        username: 'testuser',
+        isGuest: false,
+      },
+      {
+        graphId: 'graph-1',
+        query: 'how to complete task',
+        startingNodeIds: ['node-start'],
+        direction: 'forward',
+        crawlDepth: 'shallow',
+      },
+    );
+
+    // node-heading must be excluded; crawl must step to node-step1 instead
+    expect(crawlResponse.matchedNodeIds).not.toContain('node-heading');
+    expect(crawlResponse.matchedNodeIds).toContain('node-step1');
+  });
+
   it('terminates crawl branch early when candidate neighbors are exhausted or yield no matches', async () => {
     (mockWeaviate.vectorSearch as jest.Mock).mockResolvedValueOnce([]);
 
@@ -989,6 +1065,126 @@ describe('SearchService - Topological Crawl Query Engine', () => {
     expect(crawlResponse.nodes.length).toBe(1);
     expect(crawlResponse.nodes[0]!.level).toBe(0);
     expect(crawlResponse.edges.length).toBe(0);
+  });
+
+  it('crawls in global mode detaching from graph edges and searching across all nodes', async () => {
+    (mockWeaviate.vectorSearch as jest.Mock).mockResolvedValueOnce([
+      {
+        graphId: 'graph-1',
+        sourceId: 'src-isolated',
+        sourceName: 'IsolatedTopic.md',
+        nodeId: 'node-step2',
+        content: 'Detached topic reachable via global crawl mode.',
+        context: 'Global context',
+        startChar: 0,
+        endChar: 45,
+        pageNum: 1,
+        score: 0.88,
+        vector: [0.25, 0.35, 0.45],
+      },
+    ]);
+
+    const crawlResponse = await service.crawl(
+      {
+        userId: 'user-1',
+        tier: 'REGISTERED',
+        email: 'user@test.com',
+        username: 'testuser',
+        isGuest: false,
+      },
+      {
+        graphId: 'graph-1',
+        query: 'global knowledge retrieval',
+        startingNodeIds: ['node-start'],
+        direction: 'global',
+        crawlDepth: 'shallow',
+      },
+    );
+
+    expect(crawlResponse.direction).toBe('global');
+    expect(crawlResponse.nodes.length).toBeGreaterThanOrEqual(2);
+    expect(crawlResponse.edges[0]?.direction).toBe('global');
+    expect(crawlResponse.nodes.some((n) => n.nodeId === 'node-step2')).toBe(
+      true,
+    );
+  });
+
+  it('partitions large candidate sets into dynamic batches when graph has >100 nodes in global crawl', async () => {
+    const largeNodes = Array.from({ length: 250 }, (_, i) => ({
+      id: `node-${i}`,
+      data: { title: `Topic ${i}` },
+    }));
+
+    (mockGraphs.findAccessible as jest.Mock).mockResolvedValueOnce({
+      id: 'graph-large-global',
+      userId: 'user-1',
+      nodes: largeNodes,
+      edges: [],
+    });
+
+    (mockWeaviate.hybridSearch as jest.Mock).mockResolvedValueOnce([
+      {
+        graphId: 'graph-large-global',
+        sourceId: 'src-seed',
+        sourceName: 'Seed.md',
+        nodeId: 'node-0',
+        content: 'Seed topic starting match.',
+        score: 0.95,
+        vector: [0.1, 0.2, 0.3],
+      },
+    ]);
+
+    const capturedBatchQueries: any[] = [];
+    (mockWeaviate.multiVectorSearch as jest.Mock).mockImplementationOnce(
+      async (graphId: string, queries: any[]) => {
+        capturedBatchQueries.push(...queries);
+        const map = new Map<string, any[]>();
+        const lastQuery = queries[queries.length - 1];
+        if (lastQuery) {
+          map.set(lastQuery.id, [
+            {
+              graphId,
+              sourceId: 'src-far',
+              sourceName: 'Far.md',
+              nodeId: lastQuery.adjacentNodeIds[0],
+              content: 'Content discovered in distant batch.',
+              score: 0.89,
+              vector: [0.2, 0.3, 0.4],
+            },
+          ]);
+        }
+        for (const q of queries) {
+          if (!map.has(q.id)) {
+            map.set(q.id, []);
+          }
+        }
+        return map;
+      },
+    );
+
+    const crawlResponse = await service.crawl(
+      {
+        userId: 'user-1',
+        tier: 'REGISTERED',
+        email: 'user@test.com',
+        username: 'testuser',
+        isGuest: false,
+      },
+      {
+        graphId: 'graph-large-global',
+        query: 'large scale global traversal',
+        startingNodeIds: ['node-0'],
+        direction: 'global',
+        crawlDepth: 'shallow',
+      },
+    );
+
+    expect(crawlResponse.direction).toBe('global');
+    expect(capturedBatchQueries.length).toBe(3);
+    expect(capturedBatchQueries[0].adjacentNodeIds.length).toBe(100);
+    expect(capturedBatchQueries[1].adjacentNodeIds.length).toBe(100);
+    expect(capturedBatchQueries[2].adjacentNodeIds.length).toBe(50);
+    expect(crawlResponse.nodes.length).toBeGreaterThanOrEqual(2);
   });
 
   it('branches exploration when multiple distinct matches are found in next hop (same node and neighbors)', async () => {
@@ -1364,6 +1560,13 @@ describe('SearchService - Neural Reranking & Lead Answer Dossier', () => {
         { index: 0, score: 0.96 },
         { index: 1, score: 0.32 },
       ]),
+      rerankBatch: jest
+        .fn()
+        .mockImplementation((reqs) =>
+          Promise.all(
+            reqs.map((r: any) => mockRerank.rerank!(r.query, r.texts)),
+          ),
+        ),
     };
     mockWeaviate = {
       isReady: jest.fn().mockResolvedValue(true),
@@ -1621,6 +1824,62 @@ describe('SearchService - Neural Reranking & Lead Answer Dossier', () => {
       expect.any(Number),
       expect.any(Number),
       expect.any(String),
+      expect.any(Number),
+    );
+  });
+
+  it('excludes pure heading and title chunks from search results and lead answer candidate', async () => {
+    (mockWeaviate.hybridSearch as jest.Mock).mockResolvedValueOnce([
+      {
+        graphId: 'graph-1',
+        sourceId: 'src-header',
+        sourceName: 'Chapter1.md',
+        nodeId: 'node-heap',
+        content: '# Chapter 1: Priority Queues and Binary Heaps',
+        elementType: 'section_header',
+        context: 'Chapter 1 context',
+        score: 0.99,
+      },
+      {
+        graphId: 'graph-1',
+        sourceId: 'src-1',
+        sourceName: 'Algorithms.md',
+        nodeId: 'node-dijkstra',
+        content:
+          'Dijkstra algorithm uses min-heap priority queue to extract min in logarithmic time across intermediate stages.',
+        elementType: 'text',
+        context: 'Dijkstra context',
+        score: 0.85,
+      },
+    ]);
+
+    (mockRerank.rerank as jest.Mock).mockResolvedValueOnce([
+      { index: 0, score: 0.92 },
+    ]);
+
+    const response = await service.search(
+      {
+        userId: 'user-1',
+        tier: 'REGISTERED',
+        email: 'user@test.com',
+        username: 'testuser',
+        isGuest: false,
+      },
+      {
+        graphId: 'graph-1',
+        query: 'min heap priority queue',
+      },
+    );
+
+    // The heading chunk should be excluded from search results and leadAnswer
+    expect(
+      response.results.find((r) => r.nodeId === 'node-heap'),
+    ).toBeUndefined();
+    expect(response.results.some((r) => r.nodeId === 'node-dijkstra')).toBe(
+      true,
+    );
+    expect(response.leadAnswer?.chunk.content).toContain(
+      'Dijkstra algorithm uses min-heap',
     );
   });
 
@@ -2613,6 +2872,229 @@ describe('SearchService - Neural Reranking & Lead Answer Dossier', () => {
       );
     });
 
+    it('executes coordinated rerankBatch across active crawl frontiers', async () => {
+      (mockGraphs.findAccessible as jest.Mock).mockResolvedValueOnce({
+        id: 'graph-batch-crawl',
+        userId: 'user-1',
+        updatedAt: new Date(),
+        nodes: [
+          { id: 'node-x', data: { title: 'Calculus I' } },
+          { id: 'node-y', data: { title: 'Calculus II' } },
+        ],
+        edges: [{ id: 'e1', source: 'node-x', target: 'node-y' }],
+      });
+
+      (mockWeaviate.hybridSearch as jest.Mock).mockImplementationOnce(() => {
+        return Promise.resolve([
+          {
+            graphId: 'graph-batch-crawl',
+            sourceId: 'src-seed',
+            sourceName: 'Diff.md',
+            nodeId: 'node-x',
+            content: 'Differential calculus introduction and derivatives.',
+            score: 0.95,
+            vector: [0.1, 0.2, 0.3],
+          },
+        ]);
+      });
+
+      (mockWeaviate.multiVectorSearch as jest.Mock).mockImplementationOnce(
+        async (_graphId: string, queries: any[]) => {
+          const map = new Map<string, any[]>();
+          for (const q of queries) {
+            map.set(q.id, [
+              {
+                graphId: 'graph-batch-crawl',
+                sourceId: 'src-1',
+                sourceName: 'Calculus.md',
+                nodeId: 'node-y',
+                content: 'Integration techniques and substitution rules.',
+                score: 0.88,
+                vector: [0.1, 0.2, 0.3],
+              },
+            ]);
+          }
+          return map;
+        },
+      );
+
+      const batchSpy = jest
+        .fn()
+        .mockResolvedValue([[{ index: 0, score: 0.95 }]]);
+      mockRerank.rerankBatch = batchSpy;
+
+      await service.crawl(
+        {
+          userId: 'user-1',
+          tier: 'REGISTERED',
+          email: 'user@test.com',
+          username: 'testuser',
+          isGuest: false,
+        },
+        {
+          graphId: 'graph-batch-crawl',
+          query: 'integration',
+          startingNodeIds: ['node-x'],
+          crawlDepth: 'shallow',
+          enableDigs: true,
+          enableLinks: true,
+          enableJumps: true,
+        },
+      );
+
+      expect(batchSpy).toHaveBeenCalled();
+      const callArgs = batchSpy.mock.calls[0][0];
+      expect(Array.isArray(callArgs)).toBe(true);
+      expect(callArgs[0]).toHaveProperty('query');
+      expect(callArgs[0].query).toContain('integration');
+      expect(callArgs[0].query).toContain('Calculus I');
+      expect(callArgs[0]).toHaveProperty('texts');
+    });
+
+    it('grounds batch reranking query in user queryText and prepends passage context', async () => {
+      (mockGraphs.findAccessible as jest.Mock).mockResolvedValueOnce({
+        id: 'graph-grounded-crawl',
+        userId: 'user-1',
+        updatedAt: new Date(),
+        nodes: [
+          { id: 'node-ml-1', data: { title: 'Optimization' } },
+          { id: 'node-ml-2', data: { title: 'Backpropagation' } },
+        ],
+        edges: [{ id: 'e-ml', source: 'node-ml-1', target: 'node-ml-2' }],
+      });
+
+      (mockWeaviate.hybridSearch as jest.Mock).mockResolvedValueOnce([
+        {
+          graphId: 'graph-grounded-crawl',
+          sourceId: 'src-seed',
+          sourceName: 'Opt.md',
+          nodeId: 'node-ml-1',
+          content: 'Gradient descent computes parameter updates iteratively.',
+          score: 0.95,
+          vector: [0.1, 0.2, 0.3],
+        },
+      ]);
+
+      (mockWeaviate.multiVectorSearch as jest.Mock).mockImplementationOnce(
+        async (_graphId: string, queries: any[]) => {
+          const map = new Map<string, any[]>();
+          for (const q of queries) {
+            map.set(q.id, [
+              {
+                graphId: 'graph-grounded-crawl',
+                sourceId: 'src-backprop',
+                sourceName: 'Backprop.md',
+                nodeId: 'node-ml-2',
+                content:
+                  'Chain rule calculates gradients for each layer in reverse.',
+                context:
+                  'Backpropagation Mechanics\nChain rule calculates gradients for each layer in reverse.',
+                score: 0.91,
+                vector: [0.2, 0.3, 0.4],
+              },
+            ]);
+          }
+          return map;
+        },
+      );
+
+      const batchSpy = jest
+        .fn()
+        .mockResolvedValue([[{ index: 0, score: 0.98 }]]);
+      mockRerank.rerankBatch = batchSpy;
+
+      await service.crawl(
+        {
+          userId: 'user-1',
+          tier: 'REGISTERED',
+          email: 'user@test.com',
+          username: 'testuser',
+          isGuest: false,
+        },
+        {
+          graphId: 'graph-grounded-crawl',
+          query: 'how does backpropagation work',
+          startingNodeIds: ['node-ml-1'],
+          crawlDepth: 'shallow',
+          enableDigs: true,
+          enableLinks: true,
+          enableJumps: true,
+        },
+      );
+
+      expect(batchSpy).toHaveBeenCalled();
+      const callArgs = batchSpy.mock.calls[0][0];
+      // Query must be grounded in user query text and current topic context
+      expect(callArgs[0].query).toBe(
+        'how does backpropagation work (Optimization)',
+      );
+      // Passages must have contextual leading heading prepended
+      expect(callArgs[0].texts[0]).toBe(
+        'Backpropagation Mechanics: Chain rule calculates gradients for each layer in reverse.',
+      );
+    });
+
+    it('skips leading heading chunk in seed selection and anchors starting match to substantive passage', async () => {
+      (mockGraphs.findAccessible as jest.Mock).mockResolvedValueOnce({
+        id: 'graph-substantive-seed',
+        userId: 'user-1',
+        updatedAt: new Date(),
+        nodes: [{ id: 'node-seed', data: { title: 'Distributed Systems' } }],
+        edges: [],
+      });
+
+      // Hybrid search returns a heading chunk followed by a substantive passage
+      (mockWeaviate.hybridSearch as jest.Mock).mockResolvedValueOnce([
+        {
+          graphId: 'graph-substantive-seed',
+          sourceId: 'src-1',
+          sourceName: 'Intro.md',
+          nodeId: 'node-seed',
+          content: '# Chapter 1: Introduction to Distributed Systems',
+          elementType: 'heading',
+          score: 0.99,
+          vector: [0.1, 0.2, 0.3],
+        },
+        {
+          graphId: 'graph-substantive-seed',
+          sourceId: 'src-2',
+          sourceName: 'Consensus.md',
+          nodeId: 'node-seed',
+          content:
+            'A distributed system consists of autonomous computing elements that appear to its users as a single coherent system with replicated state machines.',
+          elementType: 'paragraph',
+          score: 0.85,
+          vector: [0.1, 0.2, 0.3],
+        },
+      ]);
+
+      const response = await service.crawl(
+        {
+          userId: 'user-1',
+          tier: 'REGISTERED',
+          email: 'user@test.com',
+          username: 'testuser',
+          isGuest: false,
+        },
+        {
+          graphId: 'graph-substantive-seed',
+          query: 'distributed system definition',
+          startingNodeIds: ['node-seed'],
+          crawlDepth: 'shallow',
+        },
+      );
+
+      // Root seed must be the substantive paragraph, not the decorative heading
+      const rootNode = response.nodes.find((n) => n.level === 0);
+      expect(rootNode).toBeDefined();
+      expect(rootNode?.chunk.content).toContain(
+        'A distributed system consists of autonomous computing elements',
+      );
+      expect(rootNode?.chunk.content).not.toBe(
+        '# Chapter 1: Introduction to Distributed Systems',
+      );
+    });
+
     it('supports up to 4 custom hypothesis groups with distinctive metadata and centroids', async () => {
       (mockGraphs.findAccessible as jest.Mock).mockResolvedValueOnce({
         id: 'graph-multi-groups',
@@ -3271,6 +3753,187 @@ describe('SearchService - Neural Reranking & Lead Answer Dossier', () => {
       (mockRedis.createSubscriber as jest.Mock).mockReturnValue(failingSub);
 
       await expect(testService.initPubSubSubscriber()).resolves.not.toThrow();
+    });
+  });
+
+  describe('RabbitMQ Async Crawl Pipeline', () => {
+    let mockRabbitMq: any;
+    let mockRedis: any;
+    let asyncSearchService: SearchService;
+
+    beforeEach(() => {
+      mockRabbitMq = {
+        publishCrawlJob: jest.fn().mockResolvedValue(undefined),
+        consumeCrawlJobs: jest.fn().mockResolvedValue(undefined),
+      };
+
+      mockRedis = {
+        get: jest.fn().mockResolvedValue(null),
+        set: jest.fn().mockResolvedValue('OK'),
+        publish: jest.fn().mockResolvedValue(1),
+      };
+
+      mockGraphs = {
+        findAccessible: jest.fn().mockResolvedValue({
+          id: 'graph-1',
+          userId: 'user-1',
+          isPrepared: true,
+          nodes: [{ id: 'node-start', data: { title: 'Starting Topic' } }],
+          edges: [],
+        }),
+        isAttached: jest.fn().mockResolvedValue(true),
+      };
+
+      asyncSearchService = new SearchService(
+        mockDb as DatabaseService,
+        mockEmbeddings as EmbeddingService,
+        mockRerank as RerankService,
+        mockWeaviate as WeaviateService,
+        mockGraphs as GraphsService,
+        mockAuth as AuthService,
+        mockAuthorization as AuthorizationService,
+        mockRedis as RedisService,
+        mockRabbitMq as any,
+      );
+    });
+
+    it('enqueues crawl job to RabbitMQ and saves QUEUED state in Redis', async () => {
+      const identity: any = {
+        userId: 'user-1',
+        tier: 'REGISTERED',
+        isGuest: false,
+      };
+
+      const dto: any = {
+        graphId: 'graph-1',
+        query: 'event-driven architecture',
+        startingNodeIds: ['node-start'],
+        jobId: 'crawl-job-test-1',
+        async: true,
+      };
+
+      const res = await asyncSearchService.enqueueCrawl(identity, dto);
+
+      expect(res.jobId).toBe('crawl-job-test-1');
+      expect(res.status).toBe('QUEUED');
+      expect(mockRedis.set).toHaveBeenCalledWith(
+        'crawl:job:crawl-job-test-1',
+        expect.stringContaining('"status":"QUEUED"'),
+        3600,
+      );
+      expect(mockRabbitMq.publishCrawlJob).toHaveBeenCalledWith(
+        expect.objectContaining({
+          jobId: 'crawl-job-test-1',
+          graphId: 'graph-1',
+          priority: 8,
+        }),
+      );
+    });
+
+    it('retrieves crawl job status from Redis', async () => {
+      (mockRedis.get as jest.Mock).mockResolvedValueOnce(
+        JSON.stringify({
+          jobId: 'crawl-job-test-1',
+          status: 'COMPLETED',
+          graphId: 'graph-1',
+          result: { queryId: 'q-1', nodes: [] },
+        }),
+      );
+
+      const job = await asyncSearchService.getCrawlJob(
+        { userId: 'user-1' } as any,
+        'crawl-job-test-1',
+      );
+
+      expect(job.status).toBe('COMPLETED');
+      expect(job.jobId).toBe('crawl-job-test-1');
+      expect(mockRedis.get).toHaveBeenCalledWith('crawl:job:crawl-job-test-1');
+    });
+
+    it('processes crawl job, writes COMPLETED state to Redis, and publishes progress', async () => {
+      jest.spyOn(asyncSearchService, 'crawl').mockResolvedValueOnce({
+        queryId: 'q-100',
+        queryType: 'crawl',
+        queryText: 'async test',
+        startingNodeIds: ['node-1'],
+        crawlDepth: 'default',
+        sensitivity: 'medium',
+        nodes: [
+          { id: 'n-1', nodeId: 'node-1', nodeTitle: 'Node 1', score: 1 } as any,
+        ],
+        edges: [],
+        maxLevelReached: 3,
+        totalMatches: 1,
+        matchedNodeIds: ['node-1'],
+        remaining: 0,
+        stats: {
+          digsCount: 1,
+          linksCount: 0,
+          jumpsCount: 0,
+          seedTitle: 'Seed',
+        },
+      });
+
+      const jobPayload = {
+        jobId: 'crawl-job-exec-1',
+        userId: 'user-1',
+        tier: 'REGISTERED',
+        isGuest: false,
+        graphId: 'graph-1',
+        dto: {
+          graphId: 'graph-1',
+          query: 'async test',
+          startingNodeIds: ['node-1'],
+        },
+        createdAt: new Date().toISOString(),
+      };
+
+      await asyncSearchService.processCrawlJob(jobPayload);
+
+      expect(mockRedis.set).toHaveBeenCalledWith(
+        'crawl:job:crawl-job-exec-1',
+        expect.stringContaining('"status":"PROCESSING"'),
+        3600,
+      );
+      expect(mockRedis.set).toHaveBeenCalledWith(
+        'crawl:job:crawl-job-exec-1',
+        expect.stringContaining('"status":"COMPLETED"'),
+        3600,
+      );
+      expect(mockRedis.publish).toHaveBeenCalledWith(
+        'crawl:progress',
+        expect.stringContaining('"status":"completed"'),
+      );
+    });
+
+    it('subscribes to consumeCrawlJobs when WORKER_ROLE is crawl or all', async () => {
+      process.env.WORKER_ROLE = 'crawl';
+      jest
+        .spyOn(asyncSearchService, 'initPubSubSubscriber')
+        .mockResolvedValue(undefined as any);
+      jest
+        .spyOn(asyncSearchService, 'warmupSystemGraphs')
+        .mockResolvedValue(undefined as any);
+
+      await asyncSearchService.onApplicationBootstrap();
+
+      expect(mockRabbitMq.consumeCrawlJobs).toHaveBeenCalled();
+      delete process.env.WORKER_ROLE;
+    });
+
+    it('skips consumeCrawlJobs when WORKER_ROLE is api', async () => {
+      process.env.WORKER_ROLE = 'api';
+      jest
+        .spyOn(asyncSearchService, 'initPubSubSubscriber')
+        .mockResolvedValue(undefined as any);
+      jest
+        .spyOn(asyncSearchService, 'warmupSystemGraphs')
+        .mockResolvedValue(undefined as any);
+
+      await asyncSearchService.onApplicationBootstrap();
+
+      expect(mockRabbitMq.consumeCrawlJobs).not.toHaveBeenCalled();
+      delete process.env.WORKER_ROLE;
     });
   });
 });

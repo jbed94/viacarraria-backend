@@ -335,6 +335,7 @@ export class AuthService {
       role: isAdmin ? 'admin' : 'user',
       storageLimitMb:
         user.storageLimitMb !== undefined ? user.storageLimitMb : null,
+      emailVerified: (user as any).emailVerified === true,
     };
     return identity;
   }

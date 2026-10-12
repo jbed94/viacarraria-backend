@@ -5,7 +5,7 @@ import { ConfigService } from '@nestjs/config';
 
 import { RedisService } from './redis.service.js';
 
-type LimitKind = 'request' | 'search' | 'guest';
+export type LimitKind = 'request' | 'search' | 'guest' | 'verification';
 
 type LimitResult = {
   success: boolean;
@@ -36,6 +36,11 @@ export const RATE_LIMIT_RULES: Record<LimitKind, RateLimitRule> = {
     windowSeconds: 3600,
     prefix: 'via-carraria:guest-sessions',
   },
+  verification: {
+    limit: 5,
+    windowSeconds: 3600,
+    prefix: 'via-carraria:verification-email',
+  },
 };
 
 @Injectable()
@@ -44,6 +49,7 @@ export class UpstashRateLimitService {
   private readonly requestLimiter?: Ratelimit;
   private readonly searchLimiter?: Ratelimit;
   private readonly guestLimiter?: Ratelimit;
+  private readonly verificationLimiter?: Ratelimit;
 
   constructor(
     config: ConfigService,
@@ -78,6 +84,16 @@ export class UpstashRateLimitService {
       analytics: true,
       timeout: 1500,
     });
+    this.verificationLimiter = new Ratelimit({
+      redis: client,
+      limiter: Ratelimit.slidingWindow(
+        RATE_LIMIT_RULES.verification.limit,
+        '1 h',
+      ),
+      prefix: RATE_LIMIT_RULES.verification.prefix,
+      analytics: true,
+      timeout: 1500,
+    });
     this.logger.log('Upstash REST rate limiters initialized.');
   }
 
@@ -94,7 +110,9 @@ export class UpstashRateLimitService {
         ? this.searchLimiter
         : kind === 'guest'
           ? this.guestLimiter
-          : this.requestLimiter;
+          : kind === 'verification'
+            ? this.verificationLimiter
+            : this.requestLimiter;
 
     if (!limiter) {
       return await this.redis.consumeRateLimit(

@@ -1,4 +1,4 @@
-name: viacarraria-backend
+proceename: viacarraria-backend
 channels:
   - conda-forge
 dependencies:

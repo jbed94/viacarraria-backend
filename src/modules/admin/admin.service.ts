@@ -23,6 +23,7 @@ import type {
   AdminUserRow,
   ViewerIdentity,
 } from '../../common/types.js';
+import { RerankService } from '../../common/services/rerank.service.js';
 
 @Injectable()
 export class AdminService {
@@ -33,6 +34,7 @@ export class AdminService {
     private readonly weaviate: WeaviateService,
     private readonly storage: StorageService,
     @Optional() private readonly similarityQueue?: SimilarityQueueService,
+    @Optional() private readonly rerank?: RerankService,
   ) {}
 
   async health(): Promise<{
@@ -43,12 +45,15 @@ export class AdminService {
       .query<{ ok: number }>('SELECT 1 AS ok')
       .then(() => true)
       .catch(() => false);
-    const [redis, rabbitMq, weaviate] = await Promise.all([
+    const [redis, rabbitMq, weaviate, rerank] = await Promise.all([
       this.redis.ping(),
       this.rabbitMq.isAvailable(),
       this.weaviate.isReady(),
+      this.rerank?.isConfigured()
+        ? this.rerank.checkHealth()
+        : Promise.resolve(false),
     ]);
-    const services = { database, redis, rabbitMq, weaviate };
+    const services = { database, redis, rabbitMq, weaviate, rerank };
     return { status: database ? 'ok' : 'degraded', services };
   }
 

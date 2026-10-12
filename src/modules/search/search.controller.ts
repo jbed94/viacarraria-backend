@@ -26,7 +26,18 @@ export class SearchController {
 
   @Post('search/crawl')
   async crawl(@Req() request: AuthenticatedRequest, @Body() dto: CrawlDto) {
+    if (dto.async) {
+      return this.searchService.enqueueCrawl(request.identity, dto);
+    }
     return this.searchService.crawl(request.identity, dto);
+  }
+
+  @Get('search/crawl/:jobId')
+  async getCrawlJob(
+    @Req() request: AuthenticatedRequest,
+    @Param('jobId') jobId: string,
+  ) {
+    return this.searchService.getCrawlJob(request.identity, jobId);
   }
 
   @Post('search/crawl/:jobId/cancel')

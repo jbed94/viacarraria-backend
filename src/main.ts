@@ -65,12 +65,16 @@ async function bootstrap(): Promise<void> {
       next: NextFunction,
     ): Promise<void> => {
       const ip = request.ip || request.socket.remoteAddress || 'unknown';
-      const kind = request.path.endsWith('/sign-in/anonymous')
-        ? 'guest'
-        : 'request';
+      const isVerification = request.path.endsWith('/send-verification-email');
+      const kind = isVerification
+        ? 'verification'
+        : request.path.endsWith('/sign-in/anonymous')
+          ? 'guest'
+          : 'request';
+      const identifier = isVerification ? `verification:${ip}` : `ip:${ip}`;
       const result = await rateLimit.limit(
         kind,
-        `ip:${ip}`,
+        identifier,
         ip,
         request.get('user-agent'),
       );
@@ -79,7 +83,9 @@ async function bootstrap(): Promise<void> {
       response.setHeader('X-RateLimit-Reset', result.reset);
       if (!result.success) {
         response.status(429).json({
-          message: 'Too many requests. Please try again shortly.',
+          message: isVerification
+            ? 'Too many verification email requests. Please wait before requesting another activation link.'
+            : 'Too many requests. Please try again shortly.',
         });
         return;
       }

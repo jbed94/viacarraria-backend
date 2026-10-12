@@ -10,6 +10,7 @@ export type ViewerIdentity = {
   isGuest: boolean;
   role?: 'admin' | 'user';
   storageLimitMb?: number | null;
+  emailVerified?: boolean;
 };
 
 export type GraphPermission = 'OWNER' | 'VIEWER';

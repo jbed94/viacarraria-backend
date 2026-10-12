@@ -103,7 +103,7 @@ describe('Compose API', () => {
     const graphs = await call<GraphSummary[]>('/graphs', {}, session.cookie);
     expect(graphs.response.ok).toBe(true);
     const graphSummary = graphs.body.find(
-      (graph) => graph.id === 'system-computer-science',
+      (graph) => graph.id === 'system-put-cs',
     );
     expect(graphSummary?.isPublic).toBe(true);
     expect(graphSummary?.permission).toBe('VIEWER');
@@ -117,7 +117,7 @@ describe('Compose API', () => {
       session.cookie,
     );
     expect(graph.response.ok).toBe(true);
-    const selectedNodeIds = ['cs-databases', 'cs-systems'].filter((nodeId) =>
+    const selectedNodeIds = ['put-cs-bazy', 'put-cs-sieci'].filter((nodeId) =>
       graph.body.nodes.some((node) => node.id === nodeId),
     );
     expect(selectedNodeIds).toHaveLength(2);

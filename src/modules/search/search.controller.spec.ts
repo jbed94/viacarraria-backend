@@ -83,4 +83,80 @@ describe('SearchController - Suggestions Endpoint', () => {
       expect.objectContaining({ term: 'Control Plane' }),
     ]);
   });
+
+  describe('Crawl Endpoints', () => {
+    it('delegates to enqueueCrawl when async is true in CrawlDto', async () => {
+      mockSearchService.enqueueCrawl = jest.fn().mockResolvedValue({
+        jobId: 'job-123',
+        status: 'QUEUED',
+        graphId: 'graph-1',
+      });
+
+      const dto = {
+        graphId: 'graph-1',
+        query: 'distributed systems',
+        startingNodeIds: ['node-1'],
+        async: true,
+      };
+
+      const result = await controller.crawl(
+        { identity: { userId: 'user-1' } } as any,
+        dto as any,
+      );
+
+      expect(mockSearchService.enqueueCrawl).toHaveBeenCalledWith(
+        { userId: 'user-1' },
+        dto,
+      );
+      expect(result).toEqual(
+        expect.objectContaining({ jobId: 'job-123', status: 'QUEUED' }),
+      );
+    });
+
+    it('delegates to crawl when async is not specified', async () => {
+      mockSearchService.crawl = jest.fn().mockResolvedValue({
+        queryId: 'query-1',
+        nodes: [],
+        edges: [],
+      });
+
+      const dto = {
+        graphId: 'graph-1',
+        query: 'distributed systems',
+        startingNodeIds: ['node-1'],
+      };
+
+      const result = await controller.crawl(
+        { identity: { userId: 'user-1' } } as any,
+        dto as any,
+      );
+
+      expect(mockSearchService.crawl).toHaveBeenCalledWith(
+        { userId: 'user-1' },
+        dto,
+      );
+      expect(result).toEqual(expect.objectContaining({ queryId: 'query-1' }));
+    });
+
+    it('delegates to getCrawlJob for job status retrieval', async () => {
+      mockSearchService.getCrawlJob = jest.fn().mockResolvedValue({
+        jobId: 'job-123',
+        status: 'COMPLETED',
+        result: { queryId: 'query-1', nodes: [] },
+      });
+
+      const result = await controller.getCrawlJob(
+        { identity: { userId: 'user-1' } } as any,
+        'job-123',
+      );
+
+      expect(mockSearchService.getCrawlJob).toHaveBeenCalledWith(
+        { userId: 'user-1' },
+        'job-123',
+      );
+      expect(result).toEqual(
+        expect.objectContaining({ jobId: 'job-123', status: 'COMPLETED' }),
+      );
+    });
+  });
 });

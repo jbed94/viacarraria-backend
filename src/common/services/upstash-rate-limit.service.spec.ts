@@ -69,4 +69,35 @@ describe('UpstashRateLimitService', () => {
       60,
     ]);
   });
+
+  it('enforces verification rate limit with 5 requests per hour ceiling', async () => {
+    const consumeRateLimit = jest.fn().mockResolvedValue({
+      success: true,
+      limit: 5,
+      remaining: 4,
+      reset: 3600,
+    });
+    const redis = {
+      consumeRateLimit,
+    } as unknown as RedisService;
+    const config = {
+      get: jest.fn(() => undefined),
+    } as unknown as ConfigService;
+    const service = new UpstashRateLimitService(config, redis);
+
+    await expect(
+      service.limit('verification', 'verification:127.0.0.1', '127.0.0.1'),
+    ).resolves.toEqual({
+      success: true,
+      limit: 5,
+      remaining: 4,
+      reset: 3600,
+    });
+    expect(consumeRateLimit.mock.calls[0]).toEqual([
+      'verification',
+      'verification:127.0.0.1',
+      5,
+      3600,
+    ]);
+  });
 });

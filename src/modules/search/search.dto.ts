@@ -41,7 +41,7 @@ export class SearchDto {
 export type SearchSensitivity = 'low' | 'medium' | 'high';
 export type SearchScope = 'narrow' | 'normal' | 'wide';
 
-export type CrawlDirection = 'forward' | 'backward' | 'both';
+export type CrawlDirection = 'forward' | 'backward' | 'both' | 'global';
 export type CrawlDepth = 'shallow' | 'default' | 'deep' | 'unlimited';
 export type CrawlMatchType = 'seed' | 'dig' | 'link' | 'jump';
 
@@ -64,7 +64,7 @@ export class CrawlDto {
   startingNodeIds!: string[];
 
   @IsOptional()
-  @IsIn(['forward', 'backward', 'both'])
+  @IsIn(['forward', 'backward', 'both', 'global'])
   direction?: CrawlDirection;
 
   @IsOptional()
@@ -143,7 +143,25 @@ export class CrawlDto {
   @Min(0.0)
   @Max(1.0)
   maxBranchEntropy?: number;
+
+  @IsOptional()
+  @IsBoolean()
+  async?: boolean;
 }
+
+export type CrawlJobStatus =
+  'QUEUED' | 'PROCESSING' | 'COMPLETED' | 'FAILED' | 'CANCELLED';
+
+export type CrawlJobResponse = {
+  jobId: string;
+  status: CrawlJobStatus;
+  graphId?: string;
+  message?: string;
+  result?: CrawlResponse;
+  error?: string;
+  createdAt?: string;
+  completedAt?: string;
+};
 
 export class HypothesisGroupDto {
   @IsString()

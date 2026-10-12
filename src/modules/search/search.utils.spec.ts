@@ -5,6 +5,17 @@ import {
   calculateComparativeMmrScore,
   selectDiverseCandidatesMmr,
   pruneAndDeduplicateBranches,
+  connectedNodes,
+  computeGraphDepthMetrics,
+  chunkArray,
+  classifyQueryIntent,
+  calculateDynamicAlpha,
+  filterLeadAnswerCandidate,
+  extractSalientAnswerSentence,
+  formatRerankPassage,
+  blendVectorMomentum,
+  classifyCrawlCandidate,
+  isHeadingOrTitleChunk,
   type ClassifiedCandidateItem,
   type CrawlBranchLike,
 } from './search.utils.js';
@@ -370,6 +381,371 @@ describe('Search Utils - MMR Diversity & Beam Pruning', () => {
       const groupOrigins = comparativePruned.map((b) => b.groupOrigin);
       expect(groupOrigins.filter((g) => g === 'groupA')).toHaveLength(2);
       expect(groupOrigins.filter((g) => g === 'groupB')).toHaveLength(2);
+    });
+  });
+
+  describe('connectedNodes in global mode', () => {
+    it('returns all other node IDs when direction is global and allNodeIds provided', () => {
+      const edges = [{ id: 'e1', source: 'node-a', target: 'node-b' }];
+      const allNodeIds = ['node-a', 'node-b', 'node-c', 'node-d'];
+      const result = connectedNodes('node-a', edges, 'global', allNodeIds);
+      expect(result).toEqual(['node-b', 'node-c', 'node-d']);
+    });
+
+    it('extracts all distinct edge endpoints except current node when allNodeIds not provided', () => {
+      const edges = [
+        { id: 'e1', source: 'node-a', target: 'node-b' },
+        { id: 'e2', source: 'node-b', target: 'node-c' },
+        { id: 'e3', source: 'node-d', target: 'node-e' },
+      ];
+      const result = connectedNodes('node-a', edges, 'global');
+      expect(result.sort()).toEqual(
+        ['node-b', 'node-c', 'node-d', 'node-e'].sort(),
+      );
+    });
+  });
+
+  describe('computeGraphDepthMetrics in global mode', () => {
+    it('returns depth metrics reflecting entire graph reachability without traversing edges', () => {
+      const nodes = [{ id: 'n1' }, { id: 'n2' }, { id: 'n3' }, { id: 'n4' }];
+      const edges = [{ id: 'e1', source: 'n1', target: 'n2' }]; // n3 and n4 have no edges
+      const metrics = computeGraphDepthMetrics(nodes, edges, ['n1'], 'global');
+
+      expect(metrics.totalReachableNodes).toBe(4);
+      expect(metrics.maxReachableHops).toBe(3);
+      expect(metrics.depthLimits).toEqual({
+        shallow: 3,
+        default: 6,
+        deep: 10,
+        unlimited: 15,
+      });
+    });
+  });
+
+  describe('chunkArray', () => {
+    it('returns empty array when input is empty', () => {
+      expect(chunkArray([], 5)).toEqual([]);
+    });
+
+    it('splits an array into chunks of specified size', () => {
+      const items = [1, 2, 3, 4, 5, 6, 7];
+      expect(chunkArray(items, 3)).toEqual([[1, 2, 3], [4, 5, 6], [7]]);
+    });
+
+    it('returns single chunk when size is greater than array length', () => {
+      const items = ['a', 'b', 'c'];
+      expect(chunkArray(items, 10)).toEqual([['a', 'b', 'c']]);
+    });
+
+    it('throws error when chunk size is zero or negative', () => {
+      expect(() => chunkArray([1, 2], 0)).toThrow(
+        'Chunk size must be greater than 0.',
+      );
+      expect(() => chunkArray([1, 2], -2)).toThrow(
+        'Chunk size must be greater than 0.',
+      );
+    });
+  });
+
+  describe('classifyQueryIntent & calculateDynamicAlpha', () => {
+    it('classifies definitional queries and returns high dense alpha 0.85', () => {
+      expect(classifyQueryIntent('what is backpropagation?')).toBe(
+        'definitional',
+      );
+      expect(classifyQueryIntent('define neural network')).toBe('definitional');
+      expect(calculateDynamicAlpha('what is backpropagation?')).toBe(0.85);
+    });
+
+    it('classifies procedural queries and returns high dense alpha 0.85', () => {
+      expect(
+        classifyQueryIntent('how do we compute gradients in PyTorch?'),
+      ).toBe('procedural');
+      expect(classifyQueryIntent('steps to rebalance an AVL tree')).toBe(
+        'procedural',
+      );
+      expect(calculateDynamicAlpha('how to implement quicksort')).toBe(0.85);
+    });
+
+    it('classifies tabular queries and returns balanced alpha 0.60', () => {
+      expect(classifyQueryIntent('course grading breakdown')).toBe('tabular');
+      expect(calculateDynamicAlpha('exam schedule and dates')).toBe(0.6);
+    });
+
+    it('classifies comparative queries and returns alpha 0.75', () => {
+      expect(classifyQueryIntent('paxos vs raft consensus')).toBe(
+        'comparative',
+      );
+      expect(calculateDynamicAlpha('difference between L1 and L2')).toBe(0.75);
+    });
+
+    it('classifies exact queries with quotes or short symbols and returns low alpha 0.40', () => {
+      expect(classifyQueryIntent('"exact match string"')).toBe('exact');
+      expect(classifyQueryIntent('O(n log n)')).toBe('exact');
+      expect(calculateDynamicAlpha('"exact match"')).toBe(0.4);
+    });
+
+    it('defaults to conceptual intent with alpha 0.70', () => {
+      expect(classifyQueryIntent('distributed consensus')).toBe('conceptual');
+      expect(calculateDynamicAlpha('distributed consensus')).toBe(0.7);
+    });
+  });
+
+  describe('filterLeadAnswerCandidate', () => {
+    const headingChunk = {
+      graphId: 'g1',
+      sourceId: 's1',
+      sourceName: 'notes.md',
+      nodeId: 'n1',
+      content: '## 3. Backpropagation Algorithm',
+      context: 'Full context',
+      startChar: 0,
+      endChar: 32,
+      pageNum: 1,
+      elementType: 'heading',
+      score: 0.95,
+    };
+
+    const shortFragmentChunk = {
+      graphId: 'g1',
+      sourceId: 's1',
+      sourceName: 'notes.md',
+      nodeId: 'n1',
+      content: 'Brief bullet point.',
+      context: 'Full context',
+      startChar: 35,
+      endChar: 55,
+      pageNum: 1,
+      elementType: 'text',
+      score: 0.88,
+    };
+
+    const substantiveBodyChunk = {
+      graphId: 'g1',
+      sourceId: 's1',
+      sourceName: 'notes.md',
+      nodeId: 'n1',
+      content:
+        'The backpropagation algorithm calculates the gradient of the loss function with respect to each weight by the chain rule, iteratively propagating error backward through the layers.',
+      context: 'Full context',
+      startChar: 60,
+      endChar: 240,
+      pageNum: 1,
+      elementType: 'text',
+      score: 0.85,
+    };
+
+    it('skips top-ranking heading chunks and selects first substantive body passage', () => {
+      const candidates = [headingChunk, substantiveBodyChunk];
+      const selected = filterLeadAnswerCandidate(candidates);
+      expect(selected).toBeDefined();
+      expect(selected?.elementType).toBe('text');
+      expect(selected?.content).toBe(substantiveBodyChunk.content);
+    });
+
+    it('skips short text fragments when a substantive passage exists', () => {
+      const candidates = [
+        headingChunk,
+        shortFragmentChunk,
+        substantiveBodyChunk,
+      ];
+      const selected = filterLeadAnswerCandidate(candidates);
+      expect(selected).toBe(substantiveBodyChunk);
+    });
+
+    it('falls back to non-heading chunk if all text chunks are short', () => {
+      const candidates = [headingChunk, shortFragmentChunk];
+      const selected = filterLeadAnswerCandidate(candidates);
+      expect(selected).toBe(shortFragmentChunk);
+    });
+
+    it('falls back to top chunk if all candidates are headings', () => {
+      const candidates = [headingChunk];
+      const selected = filterLeadAnswerCandidate(candidates);
+      expect(selected).toBe(headingChunk);
+    });
+
+    it('returns undefined when candidate list is empty', () => {
+      expect(filterLeadAnswerCandidate([])).toBeUndefined();
+    });
+  });
+
+  describe('extractSalientAnswerSentence', () => {
+    const passage =
+      'Machine learning algorithms learn from data. The backpropagation algorithm computes gradients using the chain rule. It updates weights with gradient descent.';
+
+    it('extracts the sentence with highest query term overlap', () => {
+      const salient = extractSalientAnswerSentence(
+        passage,
+        'How does backpropagation compute gradients?',
+      );
+      expect(salient).toBe(
+        'The backpropagation algorithm computes gradients using the chain rule.',
+      );
+    });
+
+    it('returns trimmed passage if passage is a single sentence', () => {
+      const single = 'A hash table provides constant time lookups on average.';
+      expect(
+        extractSalientAnswerSentence(single, 'hash table time complexity'),
+      ).toBe(single);
+    });
+
+    it('handles empty input gracefully', () => {
+      expect(extractSalientAnswerSentence('', 'query')).toBe('');
+    });
+  });
+
+  describe('formatRerankPassage', () => {
+    it('prepends leading heading from context when present and distinct', () => {
+      const chunk = {
+        content: 'Weights are adjusted using gradient descent optimization.',
+        context:
+          'Backpropagation Mechanics\nWeights are adjusted using gradient descent optimization.',
+      };
+      const formatted = formatRerankPassage(chunk);
+      expect(formatted).toBe(
+        'Backpropagation Mechanics: Weights are adjusted using gradient descent optimization.',
+      );
+    });
+
+    it('returns raw content when context is identical or missing', () => {
+      const chunk1 = {
+        content: 'Weights are adjusted using gradient descent optimization.',
+      };
+      const chunk2 = {
+        content: 'Weights are adjusted using gradient descent optimization.',
+        context: 'Weights are adjusted using gradient descent optimization.',
+      };
+      expect(formatRerankPassage(chunk1)).toBe(chunk1.content);
+      expect(formatRerankPassage(chunk2)).toBe(chunk2.content);
+    });
+
+    it('does not prepend if content already contains the first line', () => {
+      const chunk = {
+        content: 'Backpropagation Mechanics: Weights are adjusted.',
+        context: 'Backpropagation Mechanics\nWeights are adjusted.',
+      };
+      expect(formatRerankPassage(chunk)).toBe(chunk.content);
+    });
+  });
+
+  describe('blendVectorMomentum', () => {
+    it('blends candidate and anchor vectors and produces unit-normalized vector', () => {
+      const vCandidate = [1, 0, 0];
+      const vAnchor = [0, 1, 0];
+      const blended = blendVectorMomentum(vCandidate, vAnchor, 0.35);
+
+      expect(blended).toHaveLength(3);
+      // blended before norm: [0.65, 0.35, 0]
+      // norm: sqrt(0.65^2 + 0.35^2) = sqrt(0.4225 + 0.1225) = sqrt(0.545) = 0.73824
+      const norm = Math.sqrt(blended.reduce((sum, val) => sum + val * val, 0));
+      expect(norm).toBeCloseTo(1.0, 5);
+      expect(blended[0]!).toBeGreaterThan(blended[1]!); // candidate weight > anchor weight
+      expect(blended[1]!).toBeGreaterThan(0); // anchor retained
+      expect(blended[2]!).toBe(0);
+    });
+
+    it('returns candidate vector directly if anchor vector is empty or absent', () => {
+      const vCandidate = [0.6, 0.8];
+      expect(blendVectorMomentum(vCandidate, undefined)).toEqual(vCandidate);
+      expect(blendVectorMomentum(vCandidate, [])).toEqual(vCandidate);
+    });
+  });
+
+  describe('classifyCrawlCandidate - heading filter', () => {
+    it('rejects short heading candidates with fewer than 10 words', () => {
+      const match = classifyCrawlCandidate({
+        candidateNodeId: 'node-A',
+        currentNodeId: 'node-A',
+        candidateContent: '# Introduction and Background',
+        candidateElementType: 'heading',
+        isAdjacentInGraph: true,
+      });
+      expect(match).toBeNull();
+    });
+
+    it('allows substantive heading or regular body candidates', () => {
+      const match = classifyCrawlCandidate({
+        candidateNodeId: 'node-A',
+        currentNodeId: 'node-A',
+        candidateContent:
+          'This is a substantive paragraph explaining the key algorithmic trade-offs in distributed consensus protocols.',
+        candidateElementType: 'paragraph',
+        isAdjacentInGraph: true,
+        enableDigs: true,
+        digsInCurrentTopic: 0,
+        maxDigsPerTopic: 3,
+      });
+      expect(match).toBe('dig');
+    });
+  });
+
+  describe('isHeadingOrTitleChunk', () => {
+    it('identifies pure markdown headers without body text', () => {
+      expect(
+        isHeadingOrTitleChunk({
+          content: '# Chapter 1: Introduction to Machine Learning',
+        }),
+      ).toBe(true);
+
+      expect(
+        isHeadingOrTitleChunk({
+          content: '### 3.2 Raft Leader Election State Machine',
+        }),
+      ).toBe(true);
+    });
+
+    it('identifies explicit elementType heading or section_header with short text', () => {
+      expect(
+        isHeadingOrTitleChunk({
+          content: 'Neural Network Architectures',
+          elementType: 'heading',
+        }),
+      ).toBe(true);
+
+      expect(
+        isHeadingOrTitleChunk({
+          content: 'Section 4: Data Structures Overview',
+          elementType: 'section_header',
+        }),
+      ).toBe(true);
+    });
+
+    it('identifies short standalone title lines lacking terminal punctuation', () => {
+      expect(
+        isHeadingOrTitleChunk({
+          content: 'Distributed Systems Course Syllabus',
+        }),
+      ).toBe(true);
+
+      expect(
+        isHeadingOrTitleChunk({
+          content: 'Module 5: Graph Algorithms',
+        }),
+      ).toBe(true);
+    });
+
+    it('does NOT exclude substantive passages that happen to start with a section heading', () => {
+      const substantiveWithHeader = {
+        content:
+          '### 2.3 Backpropagation Algorithm\nBackpropagation computes the gradient of the loss function with respect to each network weight using the chain rule, iteratively calculating error contributions backwards across intermediate layers.',
+      };
+      expect(isHeadingOrTitleChunk(substantiveWithHeader)).toBe(false);
+    });
+
+    it('does NOT exclude standard body paragraphs or tables', () => {
+      const bodyParagraph = {
+        content:
+          'In a distributed hash table, each node is assigned a unique identifier in the key space and maintains routing tables to forward lookup queries efficiently.',
+        elementType: 'text',
+      };
+      expect(isHeadingOrTitleChunk(bodyParagraph)).toBe(false);
+
+      const tableChunk = {
+        content: '| Operation | Array | Hash Table |\n| Search | O(n) | O(1) |',
+        elementType: 'table',
+      };
+      expect(isHeadingOrTitleChunk(tableChunk)).toBe(false);
     });
   });
 });

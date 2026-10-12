@@ -2,6 +2,14 @@ import { ConfigService } from '@nestjs/config';
 import * as amqp from 'amqplib';
 
 import {
+  CRAWL_DLQ,
+  CRAWL_DLX,
+  CRAWL_QUEUE,
+  CrawlJob,
+  BATCH_RERANK_DLQ,
+  BATCH_RERANK_DLX,
+  BATCH_RERANK_QUEUE,
+  BatchRerankJob,
   PARSING_DLQ,
   PARSING_DLX,
   PARSING_QUEUE,
@@ -109,6 +117,52 @@ describe('RabbitMqService', () => {
         'x-dead-letter-routing-key': TAG_MATCHING_DLQ,
       },
     });
+
+    // 6. Assert Crawl DLX & DLQ
+    expect(mockChannel.assertExchange).toHaveBeenCalledWith(
+      CRAWL_DLX,
+      'direct',
+      { durable: true },
+    );
+    expect(mockChannel.assertQueue).toHaveBeenCalledWith(CRAWL_DLQ, {
+      durable: true,
+    });
+    expect(mockChannel.bindQueue).toHaveBeenCalledWith(
+      CRAWL_DLQ,
+      CRAWL_DLX,
+      CRAWL_DLQ,
+    );
+    expect(mockChannel.assertQueue).toHaveBeenCalledWith(CRAWL_QUEUE, {
+      durable: true,
+      arguments: {
+        'x-max-priority': 10,
+        'x-dead-letter-exchange': CRAWL_DLX,
+        'x-dead-letter-routing-key': CRAWL_DLQ,
+      },
+    });
+
+    // 7. Assert Batch Rerank DLX & DLQ
+    expect(mockChannel.assertExchange).toHaveBeenCalledWith(
+      BATCH_RERANK_DLX,
+      'direct',
+      { durable: true },
+    );
+    expect(mockChannel.assertQueue).toHaveBeenCalledWith(BATCH_RERANK_DLQ, {
+      durable: true,
+    });
+    expect(mockChannel.bindQueue).toHaveBeenCalledWith(
+      BATCH_RERANK_DLQ,
+      BATCH_RERANK_DLX,
+      BATCH_RERANK_DLQ,
+    );
+    expect(mockChannel.assertQueue).toHaveBeenCalledWith(BATCH_RERANK_QUEUE, {
+      durable: true,
+      arguments: {
+        'x-max-priority': 10,
+        'x-dead-letter-exchange': BATCH_RERANK_DLX,
+        'x-dead-letter-routing-key': BATCH_RERANK_DLQ,
+      },
+    });
   });
 
   it('publishes parsing job with default retryCount and maxRetries metadata', async () => {
@@ -200,7 +254,7 @@ describe('RabbitMqService', () => {
     await service.onModuleInit();
 
     expect(mockChannel.deleteQueue).toHaveBeenCalledWith(PARSING_QUEUE);
-    expect(mockChannel.assertQueue).toHaveBeenCalledTimes(5); // 1. DLQ, 2. failed main, 3. recreated main, 4. Tag DLQ, 5. Tag Queue
+    expect(mockChannel.assertQueue).toHaveBeenCalledTimes(9); // 1. DLQ, 2. failed main, 3. recreated main, 4. Tag DLQ, 5. Tag Queue, 6. Crawl DLQ, 7. Crawl Queue, 8. Batch DLQ, 9. Batch Queue
   });
 
   it('publishes tag matching job with default priority and retries metadata', async () => {
@@ -238,4 +292,134 @@ describe('RabbitMqService', () => {
     expect(sentPayload.maxRetries).toBe(3);
     expect(sentPayload.priority).toBe(7);
   });
+
+  it('publishes crawl job with priority and retries metadata to CRAWL_QUEUE', async () => {
+    const job: CrawlJob = {
+      jobId: 'crawl-job-456',
+      userId: 'user-1',
+      tier: 'REGISTERED',
+      isGuest: false,
+      graphId: 'graph-1',
+      dto: { query: 'consensus protocols', startingNodeIds: ['node-1'] },
+      priority: 8,
+      createdAt: new Date().toISOString(),
+    };
+
+    await service.publishCrawlJob(job);
+
+    expect(mockChannel.sendToQueue).toHaveBeenCalledWith(
+      CRAWL_QUEUE,
+      expect.any(Buffer),
+      {
+        contentType: 'application/json',
+        persistent: true,
+        priority: 8,
+      },
+    );
+
+    const sentPayload = JSON.parse(
+      mockChannel.sendToQueue.mock.calls[0][1].toString(),
+    );
+    expect(sentPayload.jobId).toBe('crawl-job-456');
+    expect(sentPayload.userId).toBe('user-1');
+    expect(sentPayload.retryCount).toBe(0);
+    expect(sentPayload.maxRetries).toBe(2);
+    expect(sentPayload.priority).toBe(8);
+  });
+
+  it('sets up prefetch and consumer for crawl jobs', async () => {
+    const handler = jest.fn().mockResolvedValue(undefined);
+    mockChannel.prefetch = jest.fn().mockResolvedValue(undefined);
+    mockChannel.consume = jest.fn().mockImplementation((queue, cb) => {
+      const msg = {
+        content: Buffer.from(
+          JSON.stringify({
+            jobId: 'crawl-1',
+            userId: 'user-1',
+            tier: 'REGISTERED',
+            isGuest: false,
+            graphId: 'g-1',
+            dto: {},
+            createdAt: '2026-10-11T00:00:00Z',
+          }),
+        ),
+      };
+      return cb(msg);
+    });
+    mockChannel.ack = jest.fn();
+
+    await service.consumeCrawlJobs(handler);
+
+    expect(mockChannel.prefetch).toHaveBeenCalledWith(2);
+    expect(mockChannel.consume).toHaveBeenCalledWith(
+      CRAWL_QUEUE,
+      expect.any(Function),
+    );
+    expect(handler).toHaveBeenCalledWith(
+      expect.objectContaining({ jobId: 'crawl-1' }),
+    );
+    expect(mockChannel.ack).toHaveBeenCalled();
+  });
+
+  it('publishes batch rerank job with priority and retries metadata to BATCH_RERANK_QUEUE', async () => {
+    const job: BatchRerankJob = {
+      jobId: 'batch-rerank-1',
+      items: [
+        { query: 'binary search tree', texts: ['A BST is a rooted binary tree...'] },
+        { query: 'graph traversal', texts: ['BFS uses a queue...', 'DFS uses recursion...'] },
+      ],
+      priority: 9,
+    };
+
+    await service.publishBatchRerankJob(job);
+
+    expect(mockChannel.sendToQueue).toHaveBeenCalledWith(
+      BATCH_RERANK_QUEUE,
+      expect.any(Buffer),
+      {
+        contentType: 'application/json',
+        persistent: true,
+        priority: 9,
+      },
+    );
+
+    const sentPayload = JSON.parse(
+      mockChannel.sendToQueue.mock.calls[0][1].toString(),
+    );
+    expect(sentPayload.jobId).toBe('batch-rerank-1');
+    expect(sentPayload.items).toHaveLength(2);
+    expect(sentPayload.retryCount).toBe(0);
+    expect(sentPayload.maxRetries).toBe(2);
+    expect(sentPayload.priority).toBe(9);
+  });
+
+  it('sets up prefetch and consumer for batch rerank jobs', async () => {
+    const handler = jest.fn().mockResolvedValue(undefined);
+    mockChannel.prefetch = jest.fn().mockResolvedValue(undefined);
+    mockChannel.consume = jest.fn().mockImplementation((queue, cb) => {
+      const msg = {
+        content: Buffer.from(
+          JSON.stringify({
+            jobId: 'batch-rerank-2',
+            items: [{ query: 'sorting', texts: ['quicksort'] }],
+          }),
+        ),
+      };
+      return cb(msg);
+    });
+    mockChannel.ack = jest.fn();
+
+    await service.consumeBatchRerankJobs(handler);
+
+    expect(mockChannel.prefetch).toHaveBeenCalledWith(2);
+    expect(mockChannel.consume).toHaveBeenCalledWith(
+      BATCH_RERANK_QUEUE,
+      expect.any(Function),
+    );
+    expect(handler).toHaveBeenCalledWith(
+      expect.objectContaining({ jobId: 'batch-rerank-2' }),
+    );
+    expect(mockChannel.ack).toHaveBeenCalled();
+  });
 });
+

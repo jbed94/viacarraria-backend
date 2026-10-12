@@ -155,8 +155,22 @@ export function adjacentNodes(
 export function connectedNodes(
   nodeId: string,
   edges: GraphEdgeLike[],
-  direction: 'forward' | 'backward' | 'both' = 'forward',
+  direction: 'forward' | 'backward' | 'both' | 'global' = 'forward',
+  allNodeIds?: string[],
 ): string[] {
+  if (direction === 'global') {
+    if (allNodeIds && allNodeIds.length > 0) {
+      return allNodeIds.filter((id) => id !== nodeId);
+    }
+    const nodeSet = new Set<string>();
+    for (const edge of edges) {
+      if (edge.source) nodeSet.add(edge.source);
+      if (edge.target) nodeSet.add(edge.target);
+    }
+    nodeSet.delete(nodeId);
+    return Array.from(nodeSet);
+  }
+
   let matchedEdges: Array<{ neighborId: string; weight: number }> = [];
 
   if (direction === 'forward') {
@@ -217,8 +231,24 @@ export function computeGraphDepthMetrics(
   _nodes: Array<{ id: string }>,
   edges: GraphEdgeLike[],
   startingNodeIds: string[],
-  direction: 'forward' | 'backward' | 'both' = 'forward',
+  direction: 'forward' | 'backward' | 'both' | 'global' = 'forward',
 ): GraphDepthMetrics {
+  if (direction === 'global') {
+    const totalNodes =
+      _nodes.length > 0 ? _nodes.length : startingNodeIds.length;
+    const D = Math.max(1, totalNodes - 1);
+    return {
+      maxReachableHops: D,
+      totalReachableNodes: totalNodes,
+      depthLimits: {
+        shallow: 3,
+        default: 6,
+        deep: 10,
+        unlimited: 15,
+      },
+    };
+  }
+
   const visited = new Set<string>(startingNodeIds);
   const queue: Array<{ id: string; depth: number }> = startingNodeIds.map(
     (id) => ({ id, depth: 0 }),
@@ -331,7 +361,7 @@ export function occurrences(content: string, term: string): number {
   return content.split(term).length - 1;
 }
 
-const COMMON_STOP_WORDS = new Set([
+export const COMMON_STOP_WORDS = new Set([
   'a',
   'about',
   'above',
@@ -525,6 +555,7 @@ export function getSensitivityThresholds(
   minLexScore: number;
   rerankThreshold: number;
 } {
+  void _sensitivity;
   return { vectorThreshold: 0.05, minLexScore: 1, rerankThreshold: 0.05 };
 }
 
@@ -1059,6 +1090,7 @@ export type ClassifyCrawlCandidateOptions = {
   currentNodeId: string;
   currentTopicTitle?: string;
   candidateContent: string;
+  candidateElementType?: string;
   isAdjacentInGraph: boolean;
   connectedTopicTitles?: string[];
   enableDigs?: boolean;
@@ -1084,6 +1116,7 @@ export function classifyCrawlCandidate(
     currentNodeId,
     currentTopicTitle,
     candidateContent,
+    candidateElementType,
     isAdjacentInGraph,
     connectedTopicTitles = [],
     enableDigs = true,
@@ -1097,6 +1130,16 @@ export function classifyCrawlCandidate(
     maxJumps = 3,
     semanticSimilarity,
   } = options;
+
+  // Exclude standalone titles and headers from becoming crawl nodes
+  if (
+    isHeadingOrTitleChunk({
+      content: candidateContent,
+      elementType: candidateElementType,
+    })
+  ) {
+    return null;
+  }
 
   let { minJumpSimilarity, similarityGapThreshold } = options;
 
@@ -1336,7 +1379,7 @@ export function selectDiverseCandidatesMmr<T>(
         cand.vector.length > 0
       ) {
         let maxSimToOtherGroups = 0;
-        for (const centroid of otherGroupCentroids!) {
+        for (const centroid of otherGroupCentroids) {
           if (centroid.length === cand.vector.length) {
             const sim = cosineSimilarity(cand.vector, centroid);
             if (sim > maxSimToOtherGroups) {
@@ -1503,4 +1546,289 @@ export function pruneAndDeduplicateBranches<T extends CrawlBranchLike>(
   }
 
   return keptBranches.slice(0, maxBranches);
+}
+
+/**
+ * Partitions an array into contiguous chunks of a given maximum size.
+ * Useful for batching large node ID sets or candidate queries to bound memory and payload size.
+ */
+export function chunkArray<T>(items: T[], size: number): T[][] {
+  if (size <= 0) {
+    throw new Error('Chunk size must be greater than 0.');
+  }
+  if (!Array.isArray(items) || items.length === 0) {
+    return [];
+  }
+  const chunks: T[][] = [];
+  for (let i = 0; i < items.length; i += size) {
+    chunks.push(items.slice(i, i + size));
+  }
+  return chunks;
+}
+
+export type QueryIntent =
+  | 'tabular'
+  | 'definitional'
+  | 'procedural'
+  | 'comparative'
+  | 'exact'
+  | 'conceptual';
+
+/**
+ * Classifies query intent based on structural and linguistic patterns.
+ */
+export function classifyQueryIntent(query: string): QueryIntent {
+  if (!query || !query.trim()) return 'conceptual';
+  const q = query.trim().toLowerCase();
+  if (isTabularQuery(q)) return 'tabular';
+  if (
+    /^(what is|what are|define|definition of|meaning of|concept of)\b/i.test(q)
+  ) {
+    return 'definitional';
+  }
+  if (
+    /^(how to|how do|how does|how can|steps to|algorithm for|procedure for|process of)\b/i.test(
+      q,
+    )
+  ) {
+    return 'procedural';
+  }
+  if (
+    /\b(vs|versus|difference between|compare|comparison|tradeoffs?)\b/i.test(q)
+  ) {
+    return 'comparative';
+  }
+  if (
+    q.includes('"') ||
+    /^[a-z0-9_-]{1,6}$/i.test(q) ||
+    /\b(o\(|o\s*\()/i.test(q)
+  ) {
+    return 'exact';
+  }
+  return 'conceptual';
+}
+
+/**
+ * Calculates query-sensitive dynamic alpha for hybrid search.
+ * Higher alpha prioritizes dense semantic matching (e.g. for questions).
+ * Lower alpha prioritizes sparse BM25 exact keyword matching (e.g. for exact quotes or codes).
+ */
+export function calculateDynamicAlpha(query: string): number {
+  const intent = classifyQueryIntent(query);
+  switch (intent) {
+    case 'definitional':
+    case 'procedural':
+      return 0.85;
+    case 'exact':
+      return 0.4;
+    case 'tabular':
+      return 0.6;
+    case 'comparative':
+      return 0.75;
+    case 'conceptual':
+    default:
+      return 0.7;
+  }
+}
+
+/**
+ * Determines whether a chunk is a standalone title, header, or section banner
+ * lacking substantive body text, preventing empty/uninformative cards in search & crawl.
+ */
+export function isHeadingOrTitleChunk(chunk: {
+  content: string;
+  elementType?: string;
+}): boolean {
+  if (!chunk || typeof chunk.content !== 'string') return true;
+  const trimmed = chunk.content.trim();
+  if (trimmed.length === 0) return true;
+
+  // 1. Explicit elementType from parser (Docling or ingestion worker)
+  const el = (chunk.elementType || '').toLowerCase();
+  const isTaggedHeading =
+    el === 'heading' || el === 'section_header' || el === 'title';
+
+  const words = trimmed.split(/\s+/).filter(Boolean);
+  const wordCount = words.length;
+
+  if (isTaggedHeading) {
+    if (wordCount < 20) return true;
+    const sentences = trimmed
+      .split(/(?<=[.!?])\s+/)
+      .filter((s) => s.trim().length > 0);
+    if (sentences.length <= 1 && !/[.!?]$/.test(trimmed)) {
+      return true;
+    }
+  }
+
+  // 2. Markdown heading format: lines starting with #
+  if (/^#{1,6}\s+/m.test(trimmed)) {
+    const nonHeadingLines = trimmed
+      .split('\n')
+      .filter((line) => !line.trim().startsWith('#') && line.trim().length > 0);
+    const bodyWords = nonHeadingLines.join(' ').split(/\s+/).filter(Boolean);
+    if (bodyWords.length < 15) {
+      return true;
+    }
+  }
+
+  // 3. Structural title, chapter banner, or document headline lacking body text
+  const isStructuralHeaderPrefix =
+    /^(?:chapter|section|module|unit|part|appendix|lecture|week|session)\s+[0-9a-zA-Z]+[:.]?\s*/i.test(
+      trimmed,
+    );
+  const isTitlePrefix = /^title:\s*/i.test(trimmed);
+  const isBannerKeyword =
+    /\b(?:syllabus|overview|outline|table of contents|index|bibliography|references|course notes|lecture notes)\b/i.test(
+      trimmed,
+    );
+  const isAllUppercase =
+    trimmed.length >= 4 &&
+    trimmed === trimmed.toUpperCase() &&
+    /[A-Z]/.test(trimmed);
+
+  if (
+    !trimmed.includes('\n') &&
+    !/[.!?]$/.test(trimmed) &&
+    (isStructuralHeaderPrefix ||
+      isTitlePrefix ||
+      (wordCount <= 8 && (isBannerKeyword || isAllUppercase)))
+  ) {
+    return true;
+  }
+
+  return false;
+}
+
+/**
+ * Selects an informative body chunk for lead answer formulation, preventing
+ * standalone heading/title chunks or vacuous fragments from posing as answers.
+ */
+export function filterLeadAnswerCandidate(
+  chunks: SearchChunk[],
+): SearchChunk | undefined {
+  if (!chunks || chunks.length === 0) return undefined;
+
+  // 1. Look for first non-heading chunk with substantive text length (>= 15 words)
+  const substantivePassage = chunks.find((c) => {
+    if (isHeadingOrTitleChunk(c)) return false;
+    const wordCount = c.content.trim().split(/\s+/).length;
+    return wordCount >= 15;
+  });
+
+  if (substantivePassage) {
+    return substantivePassage;
+  }
+
+  // 2. Fall back to any non-heading chunk
+  const nonHeading = chunks.find((c) => !isHeadingOrTitleChunk(c));
+  if (nonHeading) {
+    return nonHeading;
+  }
+
+  // 3. Fall back to top candidate
+  return chunks[0];
+}
+
+/**
+ * Extractive sentence salience scoring without generative LLMs.
+ * Identifies the most informative sentence inside a passage that directly addresses the query.
+ */
+export function extractSalientAnswerSentence(
+  content: string,
+  query: string,
+): string {
+  if (!content || !content.trim()) return '';
+  const sentences = content
+    .split(/(?<=[.!?])\s+|\n+/)
+    .map((s) => s.trim())
+    .filter((s) => s.length > 10);
+
+  if (sentences.length <= 1) return content.trim();
+
+  const queryTokens = new Set(
+    query
+      .toLowerCase()
+      .split(/[^a-z0-9_-]+/)
+      .filter((t) => t.length >= 3 && !COMMON_STOP_WORDS.has(t)),
+  );
+
+  if (queryTokens.size === 0) {
+    return sentences[0] || content.trim();
+  }
+
+  let bestSentence = sentences[0] || '';
+  let bestScore = -1;
+
+  sentences.forEach((sentence, idx) => {
+    const sTokens = sentence.toLowerCase().split(/[^a-z0-9_-]+/);
+    let matchCount = 0;
+    for (const t of sTokens) {
+      if (queryTokens.has(t)) matchCount++;
+    }
+    const positionBonus = 1.0 / (1.0 + idx * 0.15);
+    const score = matchCount * 2.0 + positionBonus;
+    if (score > bestScore) {
+      bestScore = score;
+      bestSentence = sentence;
+    }
+  });
+
+  return bestSentence || content.trim();
+}
+
+/**
+ * Formats a chunk passage for cross-encoder reranking by prepending the
+ * contextual leading heading/title line if available and not redundant.
+ */
+export function formatRerankPassage(chunk: {
+  content: string;
+  context?: string;
+}): string {
+  if (chunk.context && chunk.context !== chunk.content) {
+    const firstLine = chunk.context.split('\n', 1)[0]?.trim() || '';
+    if (
+      firstLine &&
+      !chunk.content.includes(firstLine) &&
+      firstLine.length < 120
+    ) {
+      return `${firstLine}: ${chunk.content}`;
+    }
+  }
+  return chunk.content;
+}
+
+/**
+ * Computes an anchored frontier exploration vector by blending the candidate vector
+ * with the original query anchor vector, preventing cumulative semantic drift across hops.
+ */
+export function blendVectorMomentum(
+  candidateVector: number[],
+  anchorVector?: number[],
+  alpha = 0.35,
+): number[] {
+  if (
+    !anchorVector ||
+    anchorVector.length === 0 ||
+    anchorVector.length !== candidateVector.length ||
+    alpha <= 0
+  ) {
+    return candidateVector;
+  }
+  const effectiveAlpha = Math.min(Math.max(alpha, 0), 0.9);
+  const blended = new Array<number>(candidateVector.length);
+  let normSq = 0;
+  for (let i = 0; i < candidateVector.length; i++) {
+    const val =
+      effectiveAlpha * anchorVector[i]! +
+      (1 - effectiveAlpha) * candidateVector[i]!;
+    blended[i] = val;
+    normSq += val * val;
+  }
+  const norm = Math.sqrt(normSq);
+  if (norm === 0) return candidateVector;
+  for (let i = 0; i < blended.length; i++) {
+    blended[i] = blended[i]! / norm;
+  }
+  return blended;
 }
